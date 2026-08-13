@@ -4,8 +4,8 @@ set -eu
 RELEASE_ARCHIVE=${1:-/tmp/oyo-danmu-api.tar.gz}
 RELEASE_SHA=${2:-unknown}
 NODE_VERSION=${NODE_VERSION:-24.19.0}
-NODE_SHA256=${NODE_SHA256:-14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647}
-NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.xz"
+NODE_SHA256=${NODE_SHA256:-f625d97cd707df4ff96254916fbc5ff014f09c09effe5a1e0ca8f6d41a8789d4}
+NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64.tar.gz"
 NODE_URL="https://nodejs.org/dist/v${NODE_VERSION}/${NODE_ARCHIVE}"
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -31,7 +31,7 @@ if [ ! -x "$node_root/bin/node" ]; then
   trap 'rm -rf "$tmp_node"' EXIT INT TERM
   wget -q "$NODE_URL" -O "$tmp_node/$NODE_ARCHIVE"
   printf '%s  %s\n' "$NODE_SHA256" "$tmp_node/$NODE_ARCHIVE" | sha256sum -c -
-  tar -xJf "$tmp_node/$NODE_ARCHIVE" -C /opt
+  tar -xzf "$tmp_node/$NODE_ARCHIVE" -C /opt
   rm -rf "$tmp_node"
   trap - EXIT INT TERM
 fi
