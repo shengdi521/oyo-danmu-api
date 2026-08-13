@@ -1,11 +1,19 @@
 const SERVICE_NAME = "oyo-danmu-api";
 
-const BLOCKED_PATHS = [
-  /(?:^|\/)api\/(?:logs|config|deploy|clearlogs|clearcache|reqrecords|cacheanimes)(?:\/|$)/i,
-  /(?:^|\/)api\/(?:setenv|addenv|delenv|aiverify)(?:\/|$)/i,
-  /(?:^|\/)api\/(?:cookie|forward-trace)(?:\/|$)/i,
-  /(?:^|\/)api\/v2\/favorite\/(?:add|remove|refresh|schedule)(?:\/|$)/i,
+const PUBLIC_ROUTES = [
+  { methods: new Set(["GET"]), pattern: /^\/api\/v2\/search\/(?:anime|episodes)\/?$/i },
+  { methods: new Set(["POST"]), pattern: /^\/api\/v2\/match\/?$/i },
+  { methods: new Set(["GET"]), pattern: /^\/api\/v2\/bangumi\/[^/]+\/?$/i },
+  { methods: new Set(["GET"]), pattern: /^\/api\/v2\/(?:comment|extcomment)(?:\/[^/]+)?\/?$/i },
+  { methods: new Set(["POST"]), pattern: /^\/api\/v2\/segmentcomment\/?$/i },
+  { methods: new Set(["GET", "POST"]), pattern: /^\/api\/v2\/fongmi\/danmaku\/?$/i },
+  { methods: new Set(["GET", "POST"]), pattern: /^\/danmaku\/?$/i },
+  { methods: new Set(["GET", "POST"]), pattern: /^\/danmaku\/api\/v2\/fongmi\/danmaku\/?$/i },
 ];
+
+function isPublicRoute(pathname, method) {
+  return PUBLIC_ROUTES.some((route) => route.methods.has(method) && route.pattern.test(pathname));
+}
 
 const MEDIA_HOST_SUFFIXES = [
   "360kan.com", "acfun.cn", "animeko.org", "ani.rip", "bangumi.lol", "bgm.tv",
@@ -237,7 +245,7 @@ async function health(request, env) {
   }, healthy ? 200 : 503);
 }
 
-export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, validateMediaUrl, validateSegmentTarget };
+export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, isPublicRoute, validateMediaUrl, validateSegmentTarget };
 
 export default {
   async fetch(request, env, ctx) {
@@ -251,7 +259,7 @@ export default {
     if (!new Set(["GET", "HEAD", "POST"]).has(request.method)) {
       return json({ success: false, errorMessage: "Method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
     }
-    if (BLOCKED_PATHS.some((pattern) => pattern.test(url.pathname))) {
+    if (!isPublicRoute(url.pathname, request.method)) {
       return json({ success: false, errorMessage: "Not found" }, 404);
     }
     return proxy(request, env, ctx);

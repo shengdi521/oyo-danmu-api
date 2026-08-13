@@ -297,7 +297,8 @@ function createServer() {
     try {
       // 构造完整的请求 URL，反向代理场景优先使用客户端原始协议
       const scheme = resolvePublicRequestProtocol(req);
-      const fullUrl = `${scheme}://${req.headers.host}${req.url}`;
+      const publicHost = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost').split(',')[0].trim();
+      const fullUrl = `${scheme}://${publicHost}${req.url}`;
 
       // 获取请求客户端的ip，兼容反向代理场景
       let clientIp = 'unknown';
@@ -506,9 +507,10 @@ async function startServer() {
   // 启动主业务服务器（默认 9321，可通过 DANMU_API_PORT 覆盖）
   const configuredMainPort = Number.parseInt(process.env.DANMU_API_PORT ?? '', 10);
   const mainPort = Number.isNaN(configuredMainPort) ? 9321 : configuredMainPort;
+  const mainHost = String(process.env.DANMU_API_HOST || '0.0.0.0').trim() || '0.0.0.0';
   mainServer = createServer();
-  mainServer.listen(mainPort, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${mainPort}`);
+  mainServer.listen(mainPort, mainHost, () => {
+    console.log(`Server running on http://${mainHost}:${mainPort}`);
     if (detectNodeDeployPlatform() === 'node') {
       initializeFavoriteScheduler(mainPort).catch(error => {
         console.error('[server] Favorite scheduler initialization failed:', error.message);
@@ -517,9 +519,10 @@ async function startServer() {
   });
 
   // 启动5321端口的代理服务
+  const proxyHost = String(process.env.DANMU_PROXY_HOST || '127.0.0.1').trim() || '127.0.0.1';
   proxyServer = createProxyServer();
-  proxyServer.listen(5321, '0.0.0.0', () => {
-    console.log('Proxy server running on http://0.0.0.0:5321');
+  proxyServer.listen(5321, proxyHost, () => {
+    console.log(`Proxy server running on http://${proxyHost}:5321`);
 
     // 异步初始化 Bangumi Data 缓存
     setTimeout(() => initBangumiData('node', true).catch(console.error), 1000);

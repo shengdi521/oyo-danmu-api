@@ -63,6 +63,18 @@ test("management endpoints never reach the origin", async () => {
   }
 });
 
+test("the public route allow-list covers clients without exposing UI or management APIs", () => {
+  assert.equal(internals.isPublicRoute("/api/v2/search/anime", "GET"), true);
+  assert.equal(internals.isPublicRoute("/api/v2/comment/123", "GET"), true);
+  assert.equal(internals.isPublicRoute("/api/v2/segmentcomment", "POST"), true);
+  assert.equal(internals.isPublicRoute("/api/v2/fongmi/danmaku", "POST"), true);
+  assert.equal(internals.isPublicRoute("/danmaku", "GET"), true);
+  assert.equal(internals.isPublicRoute("/danmaku/api/v2/fongmi/danmaku", "GET"), true);
+  assert.equal(internals.isPublicRoute("/api/v2/favorite/list", "GET"), false);
+  assert.equal(internals.isPublicRoute("/ui/js/main.js", "GET"), false);
+  assert.equal(internals.isPublicRoute("/api/v2/search/anime", "POST"), false);
+});
+
 test("proxy authenticates to the fixed origin and preserves the client IP", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
