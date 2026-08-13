@@ -1,6 +1,10 @@
 .idea
-package-lock.json
 node_modules
 .env
 .cache
 dist
+.dev.vars
+.dev.vars.*
+.wrangler/
+edge-gateway/.wrangler/
+edge-gateway/worker-configuration.d.ts

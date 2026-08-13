@@ -1,0 +1,21 @@
+[Unit]
+Description=Cloudflare Tunnel for oyo131 danmu origin
+After=network-online.target danmu-api.service nginx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/etc/sing-box/cloudflared tunnel --no-autoupdate --token-file /etc/danmu-api/tunnel-token run
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+MemoryMax=96M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

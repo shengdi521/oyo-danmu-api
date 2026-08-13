@@ -1,0 +1,259 @@
+const SERVICE_NAME = "oyo-danmu-api";
+
+const BLOCKED_PATHS = [
+  /(?:^|\/)api\/(?:logs|config|deploy|clearlogs|clearcache|reqrecords|cacheanimes)(?:\/|$)/i,
+  /(?:^|\/)api\/(?:setenv|addenv|delenv|aiverify)(?:\/|$)/i,
+  /(?:^|\/)api\/(?:cookie|forward-trace)(?:\/|$)/i,
+  /(?:^|\/)api\/v2\/favorite\/(?:add|remove|refresh|schedule)(?:\/|$)/i,
+];
+
+const MEDIA_HOST_SUFFIXES = [
+  "360kan.com", "acfun.cn", "animeko.org", "ani.rip", "bangumi.lol", "bgm.tv",
+  "bilibili.com", "bilivideo.com", "douban.com", "doubanio.com", "douyin.com",
+  "gamer.com.tw", "hiyun.tv", "hunantv.com", "iq.com", "iqiyi.com", "ixigua.com",
+  "le.com", "letv.com", "mddcloud.com.cn", "mgtv.com", "migu.cn", "miguvideo.com",
+  "myani.org", "qq.com", "rrsp.com.cn", "snssdk.com", "sohu.com", "tv.sohu.com",
+  "xiawen.tv", "yfsp.tv", "ykimg.com", "youku.com", "zmdcq.com",
+];
+
+const SAFE_SEGMENT_TYPES = new Set([
+  "aiyifan", "animeko", "bahamut", "bilibili1", "custom", "dandan", "hanjutv",
+  "hongguo", "imgo", "leshi", "maiduidui", "migu", "other_server", "qiyi", "qq",
+  "renren", "sohu", "xigua", "youku",
+]);
+
+function json(data, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "access-control-allow-origin": "*",
+      "x-content-type-options": "nosniff",
+      ...extraHeaders,
+    },
+  });
+}
+
+function canonicalUrl(url) {
+  const canonical = new URL("https://cache.invalid");
+  canonical.pathname = url.pathname;
+  const entries = [...url.searchParams.entries()].sort(([aKey, aValue], [bKey, bValue]) =>
+    aKey === bKey ? aValue.localeCompare(bValue) : aKey.localeCompare(bKey),
+  );
+  for (const [key, value] of entries) canonical.searchParams.append(key, value);
+  return canonical;
+}
+
+function cacheTtl(pathname, method) {
+  if (method !== "GET") return 0;
+  if (/\/api\/v2\/(?:comment|extcomment|segmentcomment)(?:\/|$)/i.test(pathname)) return 1800;
+  if (/\/api\/v2\/bangumi(?:\/|$)/i.test(pathname)) return 900;
+  if (/\/api\/v2\/(?:search\/anime|search\/episodes|fongmi\/danmaku)(?:\/|$)/i.test(pathname)) return 180;
+  return 0;
+}
+
+function clientIp(request) {
+  return request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip") || "unknown";
+}
+
+function hostnameAllowed(hostname) {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!normalized || normalized === "localhost" || normalized.endsWith(".localhost") ||
+      normalized.endsWith(".local") || normalized.endsWith(".internal") ||
+      normalized === "danmu-origin.oyo131.xyz") return false;
+
+  if (normalized.includes(":")) {
+    if (normalized === "::" || normalized === "::1" || normalized.startsWith("fc") ||
+        normalized.startsWith("fd") || /^fe[89ab]/.test(normalized)) return false;
+    const mapped = normalized.match(/^(?:0*:)*ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+    return mapped ? hostnameAllowed(mapped[1]) : true;
+  }
+
+  if (!/^\d+(?:\.\d+){3}$/.test(normalized)) {
+    return MEDIA_HOST_SUFFIXES.some((suffix) => normalized === suffix || normalized.endsWith(`.${suffix}`));
+  }
+  const octets = normalized.split(".").map(Number);
+  if (octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false;
+  const [a, b, c] = octets;
+  return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 0 && c === 0) ||
+    (a === 192 && b === 0 && c === 2) ||
+    (a === 192 && b === 168) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113));
+}
+
+function validateMediaUrl(rawUrl) {
+  if (!rawUrl) return true;
+  try {
+    const parsed = new URL(rawUrl);
+    return (parsed.protocol === "https:" || parsed.protocol === "http:") && hostnameAllowed(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function validateSegmentTarget(type, rawUrl) {
+  if (!SAFE_SEGMENT_TYPES.has(String(type || "")) || typeof rawUrl !== "string" ||
+      rawUrl.length === 0 || rawUrl.length > 8192 || /[\u0000-\u001f\u007f]/.test(rawUrl)) return false;
+  if (/^https?:\/\//i.test(rawUrl)) return validateMediaUrl(rawUrl);
+  return !/^(?:file|ftp|gopher|data|javascript|ws|wss):/i.test(rawUrl);
+}
+
+async function validateUrlInputs(request, url) {
+  const queryUrl = url.searchParams.get("url");
+  if (queryUrl && !validateMediaUrl(queryUrl)) {
+    return { ok: false, response: json({ success: false, errorMessage: "Unsupported media URL" }, 400) };
+  }
+  if (request.method !== "POST" || !/\/api\/v2\/segmentcomment(?:\/|$)/i.test(url.pathname)) {
+    return { ok: true, request };
+  }
+  const length = Number.parseInt(request.headers.get("content-length") || "0", 10);
+  if (Number.isFinite(length) && length > 262144) {
+    return { ok: false, response: json({ success: false, errorMessage: "Request body too large" }, 413) };
+  }
+  let body;
+  try {
+    body = await request.text();
+    const parsed = JSON.parse(body);
+    if (!validateSegmentTarget(parsed?.type, parsed?.url)) throw new Error("unsupported URL");
+  } catch {
+    return { ok: false, response: json({ success: false, errorMessage: "Invalid segment request" }, 400) };
+  }
+  return { ok: true, request: new Request(request, { body }) };
+}
+
+function corsPreflight() {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
+      "access-control-allow-headers": "Content-Type, Authorization, User-Agent",
+      "access-control-max-age": "86400",
+    },
+  });
+}
+
+function decorate(response, cacheState, ttl = 0) {
+  const headers = new Headers(response.headers);
+  headers.delete("server");
+  headers.delete("set-cookie");
+  headers.delete("x-powered-by");
+  headers.set("access-control-allow-origin", "*");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("x-edge-cache", cacheState);
+  headers.set("x-service", SERVICE_NAME);
+  if (ttl > 0 && response.ok) {
+    headers.set("cache-control", `public, max-age=60, s-maxage=${ttl}, stale-while-revalidate=60`);
+  } else {
+    headers.set("cache-control", "no-store");
+  }
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+async function checkRateLimit(env, key) {
+  if (!env.API_RATE_LIMITER?.limit) return true;
+  return (await env.API_RATE_LIMITER.limit({ key })).success;
+}
+
+async function proxy(request, env, ctx) {
+  const incomingUrl = new URL(request.url);
+  const validated = await validateUrlInputs(request, incomingUrl);
+  if (!validated.ok) return validated.response;
+  request = validated.request;
+  const ttl = cacheTtl(incomingUrl.pathname, request.method);
+  const cacheKey = ttl > 0 ? new Request(canonicalUrl(incomingUrl), { method: "GET" }) : null;
+  if (cacheKey) {
+    const cached = await caches.default.match(cacheKey);
+    if (cached) return decorate(cached, "HIT", ttl);
+  }
+  const ip = clientIp(request);
+  if (!(await checkRateLimit(env, `${ip}:${request.method}`))) {
+    return json({ success: false, errorMessage: "Too many requests; retry shortly" }, 429, { "retry-after": "60" });
+  }
+  const originUrl = new URL(request.url);
+  originUrl.protocol = "https:";
+  originUrl.hostname = env.ORIGIN_HOSTNAME;
+  originUrl.port = "";
+  const headers = new Headers(request.headers);
+  headers.delete("host");
+  headers.delete("content-length");
+  headers.delete("x-danmu-origin-auth");
+  headers.set("x-danmu-origin-auth", env.ORIGIN_SHARED_SECRET);
+  headers.set("x-forwarded-proto", "https");
+  headers.set("x-real-ip", ip);
+  headers.set("x-forwarded-for", ip);
+  const upstreamRequest = new Request(originUrl, {
+    method: request.method,
+    headers,
+    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+    redirect: "manual",
+  });
+  let upstream;
+  try {
+    upstream = await fetch(upstreamRequest, { cache: "no-store" });
+  } catch (error) {
+    console.error(JSON.stringify({ event: "origin_fetch_failed", message: String(error) }));
+    return json({ success: false, errorMessage: "Origin temporarily unavailable" }, 503, { "retry-after": "5" });
+  }
+  const response = decorate(upstream, "MISS", ttl);
+  if (cacheKey && response.ok) {
+    ctx.waitUntil(caches.default.put(cacheKey, response.clone()).catch((error) => {
+      console.error(JSON.stringify({ event: "cache_put_failed", message: String(error) }));
+    }));
+  }
+  return response;
+}
+
+async function health(request, env) {
+  const originUrl = new URL(`https://${env.ORIGIN_HOSTNAME}/favicon.ico`);
+  const startedAt = Date.now();
+  let originStatus = 0;
+  try {
+    const response = await fetch(originUrl, {
+      method: "GET",
+      headers: { "x-danmu-origin-auth": env.ORIGIN_SHARED_SECRET },
+      cache: "no-store",
+    });
+    originStatus = response.status;
+    await response.body?.cancel();
+  } catch {
+    originStatus = 0;
+  }
+  const healthy = originStatus >= 200 && originStatus < 400;
+  return json({
+    ok: healthy,
+    service: SERVICE_NAME,
+    edge: request.cf?.colo || "local",
+    originStatus,
+    originLatencyMs: Date.now() - startedAt,
+    version: env.SERVICE_VERSION || "development",
+  }, healthy ? 200 : 503);
+}
+
+export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, validateMediaUrl, validateSegmentTarget };
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return corsPreflight();
+    if (url.pathname === "/" && request.method === "GET") {
+      return json({ ok: true, service: SERVICE_NAME, api: "https://danmu.oyo131.xyz", health: "/_edge/health", upstream: "huangxd-/danmu_api" }, 200, { "cache-control": "public, max-age=300" });
+    }
+    if (url.pathname === "/_edge/health" && request.method === "GET") return health(request, env);
+    if (url.pathname.startsWith("/_edge/")) return json({ success: false, errorMessage: "Not found" }, 404);
+    if (!new Set(["GET", "HEAD", "POST"]).has(request.method)) {
+      return json({ success: false, errorMessage: "Method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
+    }
+    if (BLOCKED_PATHS.some((pattern) => pattern.test(url.pathname))) {
+      return json({ success: false, errorMessage: "Not found" }, 404);
+    }
+    return proxy(request, env, ctx);
+  },
+};
