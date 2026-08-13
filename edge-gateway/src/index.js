@@ -186,8 +186,8 @@ async function proxy(request, env, ctx) {
     return json({ success: false, errorMessage: "Too many requests; retry shortly" }, 429, { "retry-after": "60" });
   }
   const originUrl = new URL(request.url);
-  originUrl.protocol = "https:";
-  originUrl.hostname = env.ORIGIN_HOSTNAME;
+  originUrl.protocol = "http:";
+  originUrl.hostname = "danmu.internal";
   originUrl.port = "";
   const headers = new Headers(request.headers);
   headers.delete("host");
@@ -205,7 +205,7 @@ async function proxy(request, env, ctx) {
   });
   let upstream;
   try {
-    upstream = await fetch(upstreamRequest, { cache: "no-store" });
+    upstream = await env.ORIGIN.fetch(upstreamRequest, { cache: "no-store" });
   } catch (error) {
     console.error(JSON.stringify({ event: "origin_fetch_failed", message: String(error) }));
     return json({ success: false, errorMessage: "Origin temporarily unavailable" }, 503, { "retry-after": "5" });
@@ -220,11 +220,11 @@ async function proxy(request, env, ctx) {
 }
 
 async function health(request, env) {
-  const originUrl = new URL(`https://${env.ORIGIN_HOSTNAME}/favicon.ico`);
+  const originUrl = new URL("http://danmu.internal/favicon.ico");
   const startedAt = Date.now();
   let originStatus = 0;
   try {
-    const response = await fetch(originUrl, {
+    const response = await env.ORIGIN.fetch(originUrl, {
       method: "GET",
       headers: { "x-danmu-origin-auth": env.ORIGIN_SHARED_SECRET },
       cache: "no-store",

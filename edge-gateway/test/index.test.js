@@ -9,9 +9,9 @@ function context() {
 
 function environment(overrides = {}) {
   return {
-    ORIGIN_HOSTNAME: "danmu-origin.oyo131.xyz",
     ORIGIN_SHARED_SECRET: "test-origin-secret",
     SERVICE_VERSION: "test",
+    ORIGIN: { fetch: (...args) => globalThis.fetch(...args) },
     API_RATE_LIMITER: { async limit() { return { success: true }; } },
     ...overrides,
   };
@@ -90,7 +90,7 @@ test("proxy authenticates to the fixed origin and preserves the client IP", asyn
       headers: { "cf-connecting-ip": "203.0.113.10" },
     }), environment(), ctx);
     await Promise.all(ctx.promises);
-    assert.equal(captured.url, "https://danmu-origin.oyo131.xyz/api/v2/comment/1");
+    assert.equal(captured.url, "http://danmu.internal/api/v2/comment/1");
     assert.equal(captured.headers.get("x-danmu-origin-auth"), "test-origin-secret");
     assert.equal(captured.headers.get("x-real-ip"), "203.0.113.10");
     assert.equal(response.headers.get("x-edge-cache"), "MISS");

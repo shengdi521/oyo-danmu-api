@@ -6,8 +6,8 @@
 
 ## 安全边界
 
-- Worker Secret `ORIGIN_SHARED_SECRET` 与 VPS Nginx 中的值必须一致。
-- `danmu-origin.oyo131.xyz` 只接受带该请求头的流量。
+- Worker 通过专用 Workers VPC Service 和 Cloudflare Tunnel 访问源站，VPS 不开放弹幕 Web 端口。
+- `ORIGIN_SHARED_SECRET` 仍作为纵深防御的内部请求标记，只保存为 Worker Secret。
 - 日志、配置、部署、Cookie 和收藏写操作不通过公网网关开放。
 - 直链和分片接口仅接受已知媒体域名，拒绝本机、私网和任意代理目标。
 - `.dev.vars`、VPS `.env`、隧道 token 和任何媒体 Cookie 都不能提交到 Git。

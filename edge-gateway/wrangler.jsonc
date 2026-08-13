@@ -13,9 +13,14 @@
     }
   ],
   "vars": {
-    "ORIGIN_HOSTNAME": "danmu-origin.oyo131.xyz",
     "SERVICE_VERSION": "2026.08.14"
   },
+  "vpc_services": [
+    {
+      "binding": "ORIGIN",
+      "service_id": "019ffc3d-5b13-7922-9583-2f4216b7cbe4"
+    }
+  ],
   "ratelimits": [
     {
       "name": "API_RATE_LIMITER",
