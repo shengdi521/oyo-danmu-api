@@ -31,6 +31,7 @@ import AiyifanSource from "./sources/aiyifan.js";
 import HongguoSource, { parseHongguoPlayerUrl } from "./sources/hongguo.js";
 import AnimekoSource from "./sources/animeko.js";
 import OtherSource from "./sources/other.js";
+import { httpGet, runWithRequestDeadline, settleUntilRequestDeadline } from "./utils/http-util.js";
 import { NodeHandler } from "./configs/handlers/node-handler.js";
 import { VercelHandler } from "./configs/handlers/vercel-handler.js";
 import { NetlifyHandler } from "./configs/handlers/netlify-handler.js";
@@ -194,6 +195,58 @@ test('worker.js API endpoints', async (t) => {
 
     assert(handler instanceof HuggingfaceHandler);
     assert(HandlerFactory.getSupportedPlatforms().includes('huggingface'));
+  });
+
+  await t.test('request deadline aborts inherited HTTP work and preserves completed results', async () => {
+    await withMockFetch((_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }), async () => {
+      const startedAt = Date.now();
+      const results = await runWithRequestDeadline(40, () => settleUntilRequestDeadline([
+        Promise.resolve('fast'),
+        httpGet('https://example.com/slow', { timeout: 1000 }),
+      ]));
+      assert.deepEqual(results[0], { status: 'fulfilled', value: 'fast' });
+      assert.equal(results[1].status, 'rejected');
+      assert.equal(results[1].reason.name, 'AbortError');
+      assert.ok(Date.now() - startedAt < 500);
+    });
+  });
+
+  await t.test('FongMi comments use the public host, collapse the short path, and cap candidates', async () => {
+    resetFavoriteState();
+    const anime = createFavoriteAnime('FongMi反代测试', 80, 940001);
+    const originalSearch = TencentSource.prototype.search;
+    const originalHandleAnimes = TencentSource.prototype.handleAnimes;
+    const originalOrder = Globals.envs.sourceOrderArr;
+    TencentSource.prototype.search = async () => [{}];
+    TencentSource.prototype.handleAnimes = async (_source, _title, results, details) => {
+      results.push(anime);
+      details.set(String(anime.animeId), anime);
+    };
+    try {
+      const request = new Request('http://danmu.internal/danmaku/api/v2/fongmi/danmaku?name=FongMi%E5%8F%8D%E4%BB%A3%E6%B5%8B%E8%AF%95&episode=1', {
+        headers: {
+          'x-forwarded-host': 'danmu.oyo131.xyz',
+          'x-forwarded-proto': 'https'
+        }
+      });
+      const body = await parseResponse(await handleRequest(request, {
+        SOURCE_ORDER: 'tencent',
+        USE_BANGUMI_DATA: 'false'
+      }, 'cloudflare', '127.0.0.1', {}));
+      assert.equal(body.length, 50);
+      assert.equal(body[0].url, 'https://danmu.oyo131.xyz/api/v2/comment/9400011?format=xml');
+      assert.ok(body.every(item => item.url.startsWith('https://danmu.oyo131.xyz/api/v2/comment/')));
+    } finally {
+      TencentSource.prototype.search = originalSearch;
+      TencentSource.prototype.handleAnimes = originalHandleAnimes;
+      Globals.envs.sourceOrderArr = originalOrder;
+    }
   });
 
   await t.test('HuggingfaceHandler should call Space variables and restart APIs', async () => {

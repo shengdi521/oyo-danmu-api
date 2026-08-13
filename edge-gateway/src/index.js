@@ -195,6 +195,7 @@ async function proxy(request, env, ctx) {
   headers.delete("x-danmu-origin-auth");
   headers.set("x-danmu-origin-auth", env.ORIGIN_SHARED_SECRET);
   headers.set("x-forwarded-proto", "https");
+  headers.set("x-forwarded-host", incomingUrl.host);
   headers.set("x-real-ip", ip);
   headers.set("x-forwarded-for", ip);
   const upstreamRequest = new Request(originUrl, {

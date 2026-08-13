@@ -4,6 +4,8 @@ set -eu
 TUNNEL_ID=${TUNNEL_ID:?TUNNEL_ID is required}
 CREDENTIALS_FILE=${CREDENTIALS_FILE:-/etc/danmu-api/tunnel-credentials.json}
 CLOUDFLARED_BIN=${CLOUDFLARED_BIN:-/etc/sing-box/cloudflared}
+TUNNEL_USER=cloudflared-danmu
+TUNNEL_GROUP=cloudflared-danmu
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "This installer must run as root." >&2
@@ -19,7 +21,10 @@ if [ ! -x "$CLOUDFLARED_BIN" ]; then
 fi
 
 install -d -m 0755 /etc/danmu-api
-chown nobody:nogroup "$CREDENTIALS_FILE"
+if ! id "$TUNNEL_USER" >/dev/null 2>&1; then
+  useradd --system --home-dir /nonexistent --shell /usr/sbin/nologin "$TUNNEL_USER"
+fi
+chown "$TUNNEL_USER:$TUNNEL_GROUP" "$CREDENTIALS_FILE"
 umask 077
 cat > /etc/danmu-api/cloudflared-danmu.yml <<EOF
 tunnel: ${TUNNEL_ID}
@@ -39,8 +44,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=cloudflared-danmu
+Group=cloudflared-danmu
 ExecStart=/etc/sing-box/cloudflared tunnel --no-autoupdate --config /etc/danmu-api/cloudflared-danmu.yml run
 Restart=always
 RestartSec=5
@@ -56,7 +61,7 @@ WantedBy=multi-user.target
 EOF
 
 chmod 0600 "$CREDENTIALS_FILE" /etc/danmu-api/cloudflared-danmu.yml
-chown nobody:nogroup /etc/danmu-api/cloudflared-danmu.yml
+chown "$TUNNEL_USER:$TUNNEL_GROUP" /etc/danmu-api/cloudflared-danmu.yml
 systemctl daemon-reload
 systemctl enable --now cloudflared-danmu.service
 sleep 4

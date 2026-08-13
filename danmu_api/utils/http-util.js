@@ -10,8 +10,77 @@ export const sourceLogContext = new AsyncLocalStorage();
 // 单次搜索请求内的 HTTP 响应复用缓存: 相同 URL 的重复 GET 直接复用, 借助 AsyncLocalStorage 实现请求级隔离
 export const httpCacheContext = new AsyncLocalStorage();
 
+// 单次搜索的总截止上下文。通用 HTTP 方法会自动继承该信号，
+// 避免一个失效上游把已经完成的其他来源一起卡住。
+export const requestDeadlineContext = new AsyncLocalStorage();
+
 export function runWithHttpCache(fn) {
   return httpCacheContext.run(new Map(), fn);
+}
+
+export function runWithRequestDeadline(timeoutMs, fn) {
+  // ForwardWidget 的 setTimeout 是兼容垫片，不能提供真实墙钟截止语义；
+  // 该运行时继续依赖 Widget.http 自身的请求超时。
+  if (globalThis.__FORWARD_WIDGET_RUNTIME__ === true) return fn(null);
+  const normalizedTimeout = Math.max(1, Number.parseInt(timeoutMs, 10) || 1);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), normalizedTimeout);
+  const store = { controller, deadlineAt: Date.now() + normalizedTimeout, timeoutMs: normalizedTimeout };
+  return requestDeadlineContext.run(store, async () => {
+    try {
+      return await fn(store);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
+export async function settleUntilRequestDeadline(promises) {
+  const pending = Array.from(promises);
+  const results = new Array(pending.length);
+  let remaining = pending.length;
+  let resolveAll;
+  const allDone = new Promise((resolve) => { resolveAll = resolve; });
+
+  if (remaining === 0) return results;
+  pending.forEach((promise, index) => {
+    Promise.resolve(promise).then(
+      (value) => { results[index] = { status: 'fulfilled', value }; },
+      (reason) => { results[index] = { status: 'rejected', reason }; },
+    ).finally(() => {
+      remaining--;
+      if (remaining === 0) resolveAll();
+    });
+  });
+
+  const deadlineStore = requestDeadlineContext.getStore();
+  if (!deadlineStore) {
+    await allDone;
+    return results;
+  }
+
+  const { controller } = deadlineStore;
+  if (!controller.signal.aborted) {
+    let onAbort;
+    const deadlineReached = new Promise((resolve) => {
+      onAbort = resolve;
+      controller.signal.addEventListener('abort', onAbort, { once: true });
+    });
+    await Promise.race([allDone, deadlineReached]);
+    controller.signal.removeEventListener('abort', onAbort);
+  }
+
+  if (remaining > 0) {
+    const reason = new DOMException(`Search deadline exceeded after ${deadlineStore.timeoutMs}ms`, 'AbortError');
+    for (let index = 0; index < results.length; index++) {
+      if (!results[index]) results[index] = { status: 'rejected', reason };
+    }
+  }
+  return results;
+}
+
+function inheritedSignal(explicitSignal) {
+  return explicitSignal || requestDeadlineContext.getStore()?.controller.signal;
 }
 
 // 源调度键名（sourceOrderArr）到日志标签规范名称的映射
@@ -63,8 +132,11 @@ function linkSignal(externalSignal, internalController) {
 
 // 旧版 Node（<20.19.0，自带 undici 解析响应头时丢弃 Set-Cookie）与 iOS 巨魔（无 WebAssembly、无原生 fetch）改用 node-fetch v3（其 Headers 正常暴露 Set-Cookie）；降级边界与 esm-shim 的 20.19.0 一致，Node >= 20.19.0 仍用原生 fetch。判定仅依赖静态环境、进程内恒定，故模块加载时算一次并缓存。
 function detectNodeFetchDowngrade() {
+  if (globalThis.__FORWARD_WIDGET_RUNTIME__) return false;
   if (typeof WebAssembly === 'undefined') return true;
-  const [major, minor] = process.versions.node.split('.').map(Number);
+  const nodeVersion = typeof process !== 'undefined' ? process.versions?.node : '';
+  if (!nodeVersion) return false;
+  const [major, minor] = nodeVersion.split('.').map(Number);
   return major < 20 || (major === 20 && minor < 19);
 }
 
@@ -127,7 +199,8 @@ export async function httpGet(url, options = {}) {
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
     // 链接外部中断信号并获取清理函数
-    const cleanupSignal = linkSignal(options.signal, controller);
+    const externalSignal = inheritedSignal(options.signal);
+    const cleanupSignal = linkSignal(externalSignal, controller);
 
     try {
       // 兼容iOS巨魔或旧版Node：使用node-fetch替代内置fetch
@@ -267,7 +340,7 @@ export async function httpGet(url, options = {}) {
       const currentSource = sourceLogContext.getStore() || "system";
 
       // 如果是外部信号导致的中断，停止重试并直接抛出
-      if (options.signal?.aborted) {
+      if (externalSignal?.aborted) {
         throw error;
       }
 
@@ -337,7 +410,8 @@ export async function httpPost(url, body, options = {}) {
     const timeoutId = setTimeout(() => controller.abort(), timeout);
 
     // 链接外部中断信号并获取清理函数
-    const cleanupSignal = linkSignal(options.signal, controller);
+    const externalSignal = inheritedSignal(options.signal);
+    const cleanupSignal = linkSignal(externalSignal, controller);
 
     // 处理请求头、body 和其他参数
     const { headers = {}, params, allow_redirects = true } = options;
@@ -399,7 +473,7 @@ export async function httpPost(url, body, options = {}) {
       const currentSource = sourceLogContext.getStore() || "system";
 
       // 如果是外部信号导致的中断，停止重试并直接抛出
-      if (options.signal?.aborted) {
+      if (externalSignal?.aborted) {
         throw error;
       }
 
@@ -472,9 +546,10 @@ async function httpRequestMethod(method, url, body, options = {}) {
     fetchOptions.body = options.body;
   }
 
-  // 如果传递了 signal，直接透传给 fetch
-  if (options.signal) {
-    fetchOptions.signal = options.signal;
+  // 显式信号优先，否则继承当前搜索请求的总截止信号。
+  const externalSignal = inheritedSignal(options.signal);
+  if (externalSignal) {
+    fetchOptions.signal = externalSignal;
   }
 
   try {
@@ -739,7 +814,7 @@ export async function httpGetWithStreamCheck(url, options = {}, checkCallback) {
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   // 链接外部中断信号并获取清理函数
-  const cleanupSignal = linkSignal(options.signal, controller);
+  const cleanupSignal = linkSignal(inheritedSignal(options.signal), controller);
 
   try {
     const currentSource = sourceLogContext.getStore() || "system";

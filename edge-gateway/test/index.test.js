@@ -92,6 +92,7 @@ test("proxy authenticates to the fixed origin and preserves the client IP", asyn
     await Promise.all(ctx.promises);
     assert.equal(captured.url, "http://danmu.internal/api/v2/comment/1");
     assert.equal(captured.headers.get("x-danmu-origin-auth"), "test-origin-secret");
+    assert.equal(captured.headers.get("x-forwarded-host"), "danmu.oyo131.xyz");
     assert.equal(captured.headers.get("x-real-ip"), "203.0.113.10");
     assert.equal(response.headers.get("x-edge-cache"), "MISS");
   } finally {

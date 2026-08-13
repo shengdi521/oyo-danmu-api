@@ -723,8 +723,8 @@ export default class HongguoSource extends BaseSource {
         let response;
         try {
           response = method === "GET"
-            ? await httpGet(url, { headers, timeout: 30000 })
-            : await httpPost(url, payload, { headers, timeout: 30000 });
+            ? await httpGet(url, { headers, timeout: globals.vodRequestTimeout })
+            : await httpPost(url, payload, { headers, timeout: globals.vodRequestTimeout });
         } finally {
           if (releaseCommentSlot) releaseCommentSlot();
         }
@@ -738,6 +738,7 @@ export default class HongguoSource extends BaseSource {
         this.preferredApiHost = apiHost;
         return result;
       } catch (error) {
+        if (error?.name === "AbortError") throw error;
         if (error && error.retryable === false) throw error;
         const message = error && error.message ? error.message : String(error);
         failures.push({ host: apiHost, message });

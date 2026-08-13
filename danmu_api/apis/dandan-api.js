@@ -1,5 +1,5 @@
 import { globals } from '../configs/globals.js';
-import { getPageTitle, jsonResponse, httpGet, sourceLogContext, toLogSourceName, runWithHttpCache, httpCacheContext } from '../utils/http-util.js';
+import { getPageTitle, jsonResponse, httpGet, sourceLogContext, toLogSourceName, runWithHttpCache, httpCacheContext, runWithRequestDeadline, settleUntilRequestDeadline } from '../utils/http-util.js';
 import { log } from '../utils/log-util.js'
 import { simplized } from '../utils/zh-util.js';
 import { setRedisKey, updateRedisCaches } from "../utils/redis-util.js";
@@ -448,7 +448,7 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
   }
 
   // 并发执行所有源的handleAnimes
-  const results = await Promise.allSettled(sourceTasks.map(task => task.promise));
+  const results = await settleUntilRequestDeadline(sourceTasks.map(task => task.promise));
 
   // 按SOURCE_ORDER顺序合并各源的独立结果到目标容器
   // 先处理的源数据优先保留（animeId去重、detailStore键去重）
@@ -482,10 +482,12 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
 // Extracted function for GET /api/v2/search/anime
 export async function searchAnime(url, preferAnimeId = null, preferSource = null, detailStore = null, targetPlatform = null, forceRefresh = false) {
   // 单次搜索请求内启用 HTTP 响应复用缓存: 作为各源通用的请求级复用安全网, 借助 AsyncLocalStorage 做请求级隔离
+  const runSearch = () => runWithRequestDeadline(globals.searchRequestDeadlineMs, () =>
+    searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh));
   if (httpCacheContext.getStore()) {
-    return searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh);
+    return runSearch();
   }
-  return runWithHttpCache(() => searchAnimeBody(url, preferAnimeId, preferSource, detailStore, targetPlatform, forceRefresh));
+  return runWithHttpCache(runSearch);
 }
 
 async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, detailStore = null, targetPlatform = null, forceRefresh = false) {
@@ -796,7 +798,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
     });
 
     // 并发执行所有逐源管道，每个管道内部 search 完成后立即衔接 handleAnimes
-    const pipelineResults = await Promise.allSettled(pipelineTasks.map(task => task.promise));
+    const pipelineResults = await settleUntilRequestDeadline(pipelineTasks.map(task => task.promise));
 
     // 按SOURCE_ORDER顺序合并各管道的独立结果到目标容器
     // 先处理的源数据优先保留（animeId去重、detailStore键去重）
