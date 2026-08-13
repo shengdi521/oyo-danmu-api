@@ -76,7 +76,8 @@ chmod 0600 /etc/danmu-api/danmu-api.env
 
 install -m 0644 "$release_dir/ops/danmu-api.service" /etc/systemd/system/danmu-api.service
 systemctl daemon-reload
-systemctl enable --now danmu-api.service
+systemctl enable danmu-api.service
+systemctl restart danmu-api.service
 
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
   if curl -fsS --max-time 5 http://127.0.0.1:9321/ >/dev/null; then
