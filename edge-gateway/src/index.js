@@ -15,6 +15,28 @@ function isPublicRoute(pathname, method) {
   return PUBLIC_ROUTES.some((route) => route.methods.has(method) && route.pattern.test(pathname));
 }
 
+async function timingSafeSecretEqual(provided, expected) {
+  if (typeof provided !== "string" || typeof expected !== "string" || expected.length === 0) return false;
+  const encoder = new TextEncoder();
+  const [providedHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(provided)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  if (typeof crypto.subtle.timingSafeEqual === "function") {
+    return crypto.subtle.timingSafeEqual(providedHash, expectedHash);
+  }
+  const left = new Uint8Array(providedHash);
+  const right = new Uint8Array(expectedHash);
+  let difference = 0;
+  for (let index = 0; index < left.length; index += 1) difference |= left[index] ^ right[index];
+  return difference === 0;
+}
+
+async function isManagementRoute(pathname, env) {
+  const firstSegment = pathname.split("/")[1] || "";
+  return timingSafeSecretEqual(firstSegment, env.ADMIN_PATH_TOKEN);
+}
+
 const MEDIA_HOST_SUFFIXES = [
   "360kan.com", "acfun.cn", "animeko.org", "ani.rip", "bangumi.lol", "bgm.tv",
   "bilibili.com", "bilivideo.com", "douban.com", "doubanio.com", "douyin.com",
@@ -148,18 +170,29 @@ function corsPreflight() {
   });
 }
 
-function decorate(response, cacheState, ttl = 0) {
+function decorate(response, cacheState, ttl = 0, management = false) {
   const headers = new Headers(response.headers);
   headers.delete("server");
   headers.delete("set-cookie");
   headers.delete("x-powered-by");
-  headers.set("access-control-allow-origin", "*");
   headers.set("x-content-type-options", "nosniff");
-  headers.set("x-edge-cache", cacheState);
   headers.set("x-service", SERVICE_NAME);
-  if (ttl > 0 && response.ok) {
+  if (management) {
+    headers.delete("access-control-allow-origin");
+    headers.delete("access-control-allow-credentials");
+    headers.delete("access-control-expose-headers");
+    headers.set("cache-control", "private, no-store, max-age=0");
+    headers.set("pragma", "no-cache");
+    headers.set("referrer-policy", "no-referrer");
+    headers.set("x-frame-options", "DENY");
+    headers.set("x-edge-cache", "BYPASS");
+  } else if (ttl > 0 && response.ok) {
+    headers.set("access-control-allow-origin", "*");
+    headers.set("x-edge-cache", cacheState);
     headers.set("cache-control", `public, max-age=60, s-maxage=${ttl}, stale-while-revalidate=60`);
   } else {
+    headers.set("access-control-allow-origin", "*");
+    headers.set("x-edge-cache", cacheState);
     headers.set("cache-control", "no-store");
   }
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
@@ -170,12 +203,12 @@ async function checkRateLimit(env, key) {
   return (await env.API_RATE_LIMITER.limit({ key })).success;
 }
 
-async function proxy(request, env, ctx) {
+async function proxy(request, env, ctx, { management = false } = {}) {
   const incomingUrl = new URL(request.url);
   const validated = await validateUrlInputs(request, incomingUrl);
   if (!validated.ok) return validated.response;
   request = validated.request;
-  const ttl = cacheTtl(incomingUrl.pathname, request.method);
+  const ttl = management ? 0 : cacheTtl(incomingUrl.pathname, request.method);
   const cacheKey = ttl > 0 ? new Request(canonicalUrl(incomingUrl), { method: "GET" }) : null;
   if (cacheKey) {
     const cached = await caches.default.match(cacheKey);
@@ -211,7 +244,7 @@ async function proxy(request, env, ctx) {
     console.error(JSON.stringify({ event: "origin_fetch_failed", message: String(error) }));
     return json({ success: false, errorMessage: "Origin temporarily unavailable" }, 503, { "retry-after": "5" });
   }
-  const response = decorate(upstream, "MISS", ttl);
+  const response = decorate(upstream, "MISS", ttl, management);
   if (cacheKey && response.ok) {
     ctx.waitUntil(caches.default.put(cacheKey, response.clone()).catch((error) => {
       console.error(JSON.stringify({ event: "cache_put_failed", message: String(error) }));
@@ -260,9 +293,8 @@ export default {
     if (!new Set(["GET", "HEAD", "POST"]).has(request.method)) {
       return json({ success: false, errorMessage: "Method not allowed" }, 405, { allow: "GET, HEAD, POST, OPTIONS" });
     }
-    if (!isPublicRoute(url.pathname, request.method)) {
-      return json({ success: false, errorMessage: "Not found" }, 404);
-    }
-    return proxy(request, env, ctx);
+    if (isPublicRoute(url.pathname, request.method)) return proxy(request, env, ctx);
+    if (await isManagementRoute(url.pathname, env)) return proxy(request, env, ctx, { management: true });
+    return json({ success: false, errorMessage: "Not found" }, 404);
   },
 };

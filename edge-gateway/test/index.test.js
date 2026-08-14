@@ -9,6 +9,7 @@ function context() {
 
 function environment(overrides = {}) {
   return {
+    ADMIN_PATH_TOKEN: "test-admin-token",
     ORIGIN_SHARED_SECRET: "test-origin-secret",
     SERVICE_VERSION: "test",
     ORIGIN: { fetch: (...args) => globalThis.fetch(...args) },
@@ -60,6 +61,77 @@ test("management endpoints never reach the origin", async () => {
     assert.equal(response.status, 404);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test("the secret management path proxies the UI without cache or cross-origin access", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  let captured;
+  let cacheTouched = false;
+  globalThis.caches = { default: {
+    async match() { cacheTouched = true; throw new Error("management cache lookup should not run"); },
+    async put() { cacheTouched = true; throw new Error("management cache write should not run"); },
+  } };
+  globalThis.fetch = async (request) => {
+    captured = request;
+    return new Response("<!doctype html><title>LogVar弹幕API</title>", {
+      status: 200,
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        "access-control-allow-origin": "*",
+        "set-cookie": "admin=should-not-leave-origin",
+      },
+    });
+  };
+  try {
+    const response = await worker.fetch(
+      new Request("https://danmu.oyo131.xyz/test-admin-token"),
+      environment(),
+      context(),
+    );
+    assert.equal(captured.url, "http://danmu.internal/test-admin-token");
+    assert.match(await response.text(), /LogVar弹幕API/);
+    assert.equal(response.headers.get("cache-control"), "private, no-store, max-age=0");
+    assert.equal(response.headers.get("x-edge-cache"), "BYPASS");
+    assert.equal(response.headers.get("referrer-policy"), "no-referrer");
+    assert.equal(response.headers.get("x-frame-options"), "DENY");
+    assert.equal(response.headers.get("access-control-allow-origin"), null);
+    assert.equal(response.headers.get("set-cookie"), null);
+    assert.equal(cacheTouched, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
+});
+
+test("nested management APIs proxy only below the secret path", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  const captured = [];
+  globalThis.caches = { default: { async match() { return undefined; }, async put() {} } };
+  globalThis.fetch = async (request) => {
+    captured.push(request.url);
+    return Response.json({ success: true });
+  };
+  try {
+    const allowed = await worker.fetch(
+      new Request("https://danmu.oyo131.xyz/test-admin-token/api/config"),
+      environment(),
+      context(),
+    );
+    const denied = await worker.fetch(
+      new Request("https://danmu.oyo131.xyz/wrong-admin-token/api/config"),
+      environment(),
+      context(),
+    );
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.headers.get("x-edge-cache"), "BYPASS");
+    assert.equal(denied.status, 404);
+    assert.deepEqual(captured, ["http://danmu.internal/test-admin-token/api/config"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
   }
 });
 
