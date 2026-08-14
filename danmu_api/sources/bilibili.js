@@ -1153,6 +1153,13 @@ export default class BilibiliSource extends BaseSource {
     });
   }
 
+  _resolveAccessKey() {
+    const configured = String(globals.bilibiliAccessKey || "").trim();
+    if (/^[0-9a-fA-F]{32}$/.test(configured)) return configured;
+    const rawCookie = globals.bilibliCookie || "";
+    return rawCookie.match(/(?:^|;\s*)(?:access_key|accessKey)=([0-9a-fA-F]{32})(?:;|$)/i)?.[1] || "";
+  }
+
   // APP接口专用 URL 编码
   _javaUrlEncode(str) {
     return encodeURIComponent(str)
@@ -1166,16 +1173,15 @@ export default class BilibiliSource extends BaseSource {
 
   // 港澳台代理搜索请求
   async _searchOverseaRequest(keyword, appType, webSearchType, label="Original", signal = null) {
-    const rawCookie = globals.bilibliCookie || "";
-    const akMatch = rawCookie.match(/([0-9a-fA-F]{32})/);
+    const accessKey = this._resolveAccessKey();
     const proxy = (globals.proxyUrl||'').includes('bilibili@') || (globals.proxyUrl||'').includes('@');
     if (!proxy) return [];
 
     // 1. 尝试 App 接口
-    if (akMatch) {
+    if (accessKey) {
         log("info", `[bilibili][${label}] 检测到 Access Key，启用 APP 端接口模式 (Type: ${appType})...`);
         try {
-            const params = { keyword, type: appType, area: 'tw', mobi_app: 'android', platform: 'android', build: '8140200', ts: Math.floor(Date.now()/1000), appkey: BilibiliSource.APP_KEY, access_key: akMatch[1], disable_rcmd: 1 };
+            const params = { keyword, type: appType, area: 'tw', mobi_app: 'android', platform: 'android', build: '8140200', ts: Math.floor(Date.now()/1000), appkey: BilibiliSource.APP_KEY, access_key: accessKey, disable_rcmd: 1 };
             const qs = Object.keys(params).sort().map(k => `${k}=${this._javaUrlEncode(String(params[k]))}`).join('&');
             const sign = md5(qs + BilibiliSource.APP_SEC);
 

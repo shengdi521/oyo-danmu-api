@@ -17,6 +17,40 @@ export default class IqiyiSource extends BaseSource {
   static SECRET_KEY = "howcuteitis";
   static KEY_NAME = "secret_key";
 
+  _getCookieValue(name) {
+    const cookie = globals.iqiyiCookie || "";
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return cookie.match(new RegExp(`(?:^|;\\s*)${escapedName}=([^;]*)`))?.[1] || "";
+  }
+
+  _getAccountContext() {
+    const authCookie = this._getCookieValue("P00001");
+    const userId = this._getCookieValue("P00003") || "0";
+    const vipType = this._getCookieValue("vipTypes") || "-1";
+    const vipLevel = Number.parseInt(this._getCookieValue("vipLevel") || "0", 10) || 0;
+    return {
+      authCookie,
+      userId,
+      vipType,
+      vipStatus: authCookie ? "1" : "0",
+      userVip: vipLevel > 0 ? "1" : "0",
+    };
+  }
+
+  _authenticatedHeaders(url, headers = {}) {
+    const cookie = globals.iqiyiCookie || "";
+    if (!cookie) return headers;
+    try {
+      const hostname = new URL(url).hostname.toLowerCase();
+      if (hostname === "iqiyi.com" || hostname.endsWith(".iqiyi.com")) {
+        return { ...headers, Cookie: cookie };
+      }
+    } catch {
+      // Keep the original headers for malformed or relative URLs.
+    }
+    return headers;
+  }
+
   /**
    * 搜索爱奇艺内容
    * @param {string} keyword - 搜索关键词
@@ -25,6 +59,7 @@ export default class IqiyiSource extends BaseSource {
   async search(keyword) {
     try {
       log("info", `[iqiyi] 开始搜索: ${keyword}`);
+      const account = this._getAccountContext();
 
       // 使用桌面版 API 搜索
       const params = {
@@ -37,13 +72,13 @@ export default class IqiyiSource extends BaseSource {
         version: '13.074.22699',
         pageNum: '1',
         pageSize: '25',
-        pu: '',
+        pu: account.userId === "0" ? "" : account.userId,
         u: 'f6440fc5d919dca1aea12b6aff56e1c7',
         scale: '200',
-        token: '',
-        userVip: '0',
+        token: account.authCookie,
+        userVip: account.userVip,
         conduit: '',
-        vipType: '-1',
+        vipType: account.vipType,
         os: '',
         osShortName: 'win10',
         dataType: '',
@@ -58,12 +93,12 @@ export default class IqiyiSource extends BaseSource {
 
       const doSearch = async (bypassCache = false) => {
         const resp = await httpGet(url, {
-          headers: {
+          headers: this._authenticatedHeaders(url, {
             'accept': '*/*',
             'origin': 'https://www.iqiyi.com',
             'referer': 'https://www.iqiyi.com/',
             'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-          },
+          }),
           bypassCache
         });
         if (!resp || !resp.data) return null;
@@ -498,13 +533,14 @@ export default class IqiyiSource extends BaseSource {
    * @returns {Promise<Object|null>} 解析后的响应数据，失败返回 null
    */
   async _fetchBaseInfoData(entityId) {
+    const account = this._getAccountContext();
     const params = {
       entity_id: entityId,
       device_id: 'qd5fwuaj4hunxxdgzwkcqmefeb3ww5hx',
-      auth_cookie: '',
-      user_id: '0',
-      vip_type: '-1',
-      vip_status: '0',
+      auth_cookie: account.authCookie,
+      user_id: account.userId,
+      vip_type: account.vipType,
+      vip_status: account.vipStatus,
       conduit_id: '',
       pcv: '13.082.22866',
       app_version: '13.082.22866',
@@ -526,10 +562,10 @@ export default class IqiyiSource extends BaseSource {
     const fetchEpisodeData = async (bypassCache = false) => {
       try {
         const resp = await httpGet(url, {
-          headers: {
+          headers: this._authenticatedHeaders(url, {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': 'https://www.iqiyi.com/'
-          },
+          }),
           bypassCache
         });
         if (!resp || !resp.data) return null;
@@ -592,14 +628,15 @@ export default class IqiyiSource extends BaseSource {
    */
   async _getMovieVideoId(qipuId) {
     try {
+      const account = this._getAccountContext();
       // 构建 base_info API 请求参数
       const params = {
         entity_id: qipuId,
         device_id: 'qd5fwuaj4hunxxdgzwkcqmefeb3ww5hx',
-        auth_cookie: '',
-        user_id: '0',
-        vip_type: '-1',
-        vip_status: '0',
+        auth_cookie: account.authCookie,
+        user_id: account.userId,
+        vip_type: account.vipType,
+        vip_status: account.vipStatus,
         conduit_id: '',
         pcv: '13.103.23529',
         app_version: '13.103.23529',
@@ -622,12 +659,12 @@ export default class IqiyiSource extends BaseSource {
       log("info", `[iqiyi] 请求电影详情: ${url}`);
 
       const response = await httpGet(url, {
-        headers: {
+        headers: this._authenticatedHeaders(url, {
           'accept': '*/*',
           'origin': 'https://www.iqiyi.com',
           'referer': 'https://www.iqiyi.com/',
           'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
+        })
       });
 
       if (!response || !response.data) {
@@ -845,10 +882,10 @@ export default class IqiyiSource extends BaseSource {
     let res;
     try {
       res = await httpGet(id, {
-        headers: {
+        headers: this._authenticatedHeaders(id, {
           "Content-Type": "application/json",
           "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-        },
+        }),
       });
     } catch (error) {
       log("error", "[iqiyi] 请求页面失败:", error);

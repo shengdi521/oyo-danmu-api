@@ -636,6 +636,8 @@ export class Envs {
       'VOD_REQUEST_TIMEOUT': { category: 'source', type: 'number', description: 'VOD请求超时时间，默认10000', min: 5000, max: 30000 },
       'SEARCH_REQUEST_DEADLINE_MS': { category: 'source', type: 'number', description: '整次多源搜索总截止时间（毫秒），到期后返回已完成来源，默认8000', min: 3000, max: 30000 },
       'BILIBILI_COOKIE': { category: 'source', type: 'text', description: 'B站Cookie' },
+      'BILIBILI_ACCESS_KEY': { category: 'source', type: 'text', description: 'B站APP访问密钥，用于配置代理后的港澳台搜索' },
+      'IQIYI_COOKIE': { category: 'source', type: 'text', description: '爱奇艺Cookie，用于登录态搜索和分集请求' },
       'DOUBAN_COOKIE': { category: 'source', type: 'text', description: '豆瓣Cookie' },
       'YOUKU_CONCURRENCY': { category: 'source', type: 'number', description: '优酷并发配置，默认8', min: 1, max: 16 },
       
@@ -710,6 +712,8 @@ export class Envs {
       vodRequestTimeout: this.get('VOD_REQUEST_TIMEOUT', '10000', 'string'), // vod超时时间（默认10秒）
       searchRequestDeadlineMs: this.get('SEARCH_REQUEST_DEADLINE_MS', 8000, 'number'), // 多源搜索总截止时间（默认8秒）
       bilibliCookie: this.get('BILIBILI_COOKIE', '', 'string', true), // b站cookie
+      bilibiliAccessKey: this.get('BILIBILI_ACCESS_KEY', '', 'string', true), // b站APP access key，用于港澳台代理搜索
+      iqiyiCookie: this.get('IQIYI_COOKIE', '', 'string', true), // 爱奇艺cookie
       doubanCookie: this.get('DOUBAN_COOKIE', '', 'string', true), // 豆瓣cookie
       youkuConcurrency: Math.min(this.get('YOUKU_CONCURRENCY', 8, 'number'), 16), // 优酷并发配置
       platformOrderArr: this.resolvePlatformOrder(), // 自动匹配优选平台

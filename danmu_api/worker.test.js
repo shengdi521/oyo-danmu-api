@@ -51,6 +51,7 @@ import { convertToAsciiSum } from "./utils/codec-util.js";
 import { convertToDanmakuJson, handleDanmusLike } from "./utils/danmu-util.js";
 import { Segment, SegmentListResponse } from "./models/dandan-model.js"
 import { initBangumiData, searchBangumiData, clearBangumiDataCache } from "./utils/bangumi-data-util.js";
+import { hideSensitiveInfo } from "./utils/log-util.js";
 
 // Mock Request class for testing
 class MockRequest {
@@ -306,6 +307,43 @@ test('worker.js API endpoints', async (t) => {
     });
 
     assert.equal(seenRedirectMode, 'manual');
+  });
+
+  await t.test('runtime media credentials stay separate and iQIYI auth is scoped to iQIYI hosts', async () => {
+    const accessKey = 'a'.repeat(32);
+    const csrfToken = 'b'.repeat(32);
+    Globals.init({
+      BILIBILI_COOKIE: `bili_jct=${csrfToken}; DedeUserID=123`,
+      BILIBILI_ACCESS_KEY: accessKey,
+      IQIYI_COOKIE: 'P00001=auth-token; P00003=456; vipTypes=58; vipLevel=6',
+    });
+
+    const bilibili = new BilibiliSource();
+    const iqiyi = new IqiyiSource();
+    assert.equal(bilibili._resolveAccessKey(), accessKey);
+    assert.deepEqual(iqiyi._getAccountContext(), {
+      authCookie: 'auth-token',
+      userId: '456',
+      vipType: '58',
+      vipStatus: '1',
+      userVip: '1',
+    });
+    assert.match(iqiyi._authenticatedHeaders('https://mesh.if.iqiyi.com/test').Cookie, /P00001=auth-token/);
+    assert.equal(iqiyi._authenticatedHeaders('https://pcw-api.iq.com/test').Cookie, undefined);
+
+    Globals.init({ BILIBILI_COOKIE: `bili_jct=${csrfToken}; DedeUserID=123` });
+    assert.equal(new BilibiliSource()._resolveAccessKey(), '');
+  });
+
+  await t.test('media credentials are redacted when embedded in URLs or cookie fragments', () => {
+    const output = hideSensitiveInfo(
+      'https://example.test/path?auth_cookie=iqiyi-secret&access_key=bili-secret token=x; P00001=passport-secret; bili_jct=csrf-secret; safe=1'
+    );
+    assert.equal(output.includes('iqiyi-secret'), false);
+    assert.equal(output.includes('bili-secret'), false);
+    assert.equal(output.includes('passport-secret'), false);
+    assert.equal(output.includes('csrf-secret'), false);
+    assert.equal(output.includes('safe=1'), true);
   });
 
   await t.test('buildSearchAnimeUrl should preserve special characters in keyword', async () => {
