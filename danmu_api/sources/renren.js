@@ -642,10 +642,14 @@ export default class RenrenSource extends BaseSource {
     }
 
     // Node 生产环境先给精确标题一次健康接口机会，避免完整降级链耗尽
-    // 多源搜索截止时间；未命中后再让空格变体走完整健康路由。
+    // 多源搜索截止时间；接口异常时让空格变体从下一层继续，正常空结果
+    // 则保留当前层，以免错过仅接受空格变体的接口。
     const primaryResults = isCloud
       ? await this._searchCloud(primaryKeyword)
-      : await this._searchLocal(primaryKeyword, { maxTierAttempts: 1 });
+      : await this._searchLocal(primaryKeyword, {
+          maxTierAttempts: 1,
+          advanceOnFailure: true
+        });
     if (Array.isArray(primaryResults) && primaryResults.length > 0) {
       return primaryResults;
     }
@@ -725,7 +729,7 @@ export default class RenrenSource extends BaseSource {
   /**
    * 本地环境搜索：保持原有串行降级回路，沿用健康路由缓存
    */
-  async _searchLocal(keyword, { maxTierAttempts } = {}) {
+  async _searchLocal(keyword, { maxTierAttempts, advanceOnFailure = false } = {}) {
     let allResults = [];
     let hasValidResponse = false;
 
@@ -786,8 +790,15 @@ export default class RenrenSource extends BaseSource {
 
     // 所有降级接口全部“异常报错”时，重置健康状态
     if (!hasValidResponse) {
-        log("info", `[renren] 搜索域所有降级接口均异常失败，重置健康状态至 WIN 端`);
-        API_HEALTH.search = 'WIN';
+        const nextTierIndex = currentTierIndex + tierAttempts;
+        if (advanceOnFailure && nextTierIndex < tiers.length) {
+            const nextTier = tiers[nextTierIndex];
+            log("info", `[renren] 当前搜索接口异常，空格变体将从 ${nextTier} 端继续`);
+            API_HEALTH.search = nextTier;
+        } else {
+            log("info", `[renren] 搜索域所有降级接口均异常失败，重置健康状态至 WIN 端`);
+            API_HEALTH.search = 'WIN';
+        }
     }
 
     return allResults;

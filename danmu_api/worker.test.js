@@ -255,8 +255,12 @@ test('worker.js API endpoints', async (t) => {
       limitedSource.searchAppContent = async () => { limitedTierCalls.push('TV'); return null; };
       limitedSource.performMacSearch = async () => { limitedTierCalls.push('MAC'); return null; };
       limitedSource.performNetworkSearch = async () => { limitedTierCalls.push('WEB'); return null; };
-      await limitedSource._searchLocal('单接口快速失败', { maxTierAttempts: 1 });
-      assert.equal(limitedTierCalls.length, 1);
+      await limitedSource._searchLocal('单接口快速失败', {
+        maxTierAttempts: 1,
+        advanceOnFailure: true,
+      });
+      await limitedSource._searchLocal('从下一接口继续', { maxTierAttempts: 1 });
+      assert.deepEqual(limitedTierCalls, ['WIN', 'TV']);
 
     } finally {
       Globals.deployPlatform = originalDeployPlatform;
