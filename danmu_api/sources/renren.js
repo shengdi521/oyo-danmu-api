@@ -632,25 +632,45 @@ export default class RenrenSource extends BaseSource {
       /([\u3400-\u9FFF\uF900-\uFAFF])([0-9０-９]+)$/u,
       "$1 $2"
     );
-    const searchKeywords = spacedNumberKeyword !== primaryKeyword
-      ? [primaryKeyword, spacedNumberKeyword]
-      : [primaryKeyword];
-    let lastResults = [];
+    const searchOnce = (searchKeyword) => isCloud
+      ? this._searchCloud(searchKeyword)
+      : this._searchLocal(searchKeyword);
 
-    for (let index = 0; index < searchKeywords.length; index++) {
-      const searchKeyword = searchKeywords[index];
-      const results = isCloud
-        ? await this._searchCloud(searchKeyword)
-        : await this._searchLocal(searchKeyword);
-      if (Array.isArray(results)) lastResults = results;
-      if (lastResults.length > 0) return lastResults;
-
-      if (index === 0 && searchKeywords.length > 1) {
-        log("info", `[renren] 紧贴数字标题无结果，使用空格变体重试: ${spacedNumberKeyword}`);
-      }
+    if (spacedNumberKeyword === primaryKeyword) {
+      const results = await searchOnce(primaryKeyword);
+      return Array.isArray(results) ? results : [];
     }
 
-    return lastResults;
+    // 人人单次搜索可能接近多源搜索的总截止时间。稍晚预热空格变体，
+    // 既让快速的精确命中免于额外请求，也避免串行回退被总截止时间截断。
+    let fallbackPromise = null;
+    const startFallback = () => {
+      if (!fallbackPromise) {
+        fallbackPromise = Promise.resolve()
+          .then(() => searchOnce(spacedNumberKeyword))
+          .then(
+            (value) => ({ status: "fulfilled", value }),
+            (reason) => ({ status: "rejected", reason })
+          );
+      }
+      return fallbackPromise;
+    };
+    const fallbackTimer = setTimeout(() => void startFallback(), 250);
+
+    let primaryResults;
+    try {
+      primaryResults = await searchOnce(primaryKeyword);
+    } finally {
+      clearTimeout(fallbackTimer);
+    }
+    if (Array.isArray(primaryResults) && primaryResults.length > 0) {
+      return primaryResults;
+    }
+
+    log("info", `[renren] 紧贴数字标题无结果，使用空格变体重试: ${spacedNumberKeyword}`);
+    const fallbackOutcome = await startFallback();
+    if (fallbackOutcome.status === "rejected") throw fallbackOutcome.reason;
+    return Array.isArray(fallbackOutcome.value) ? fallbackOutcome.value : [];
   }
 
   /**
