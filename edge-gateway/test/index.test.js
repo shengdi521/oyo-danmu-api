@@ -39,6 +39,7 @@ test("media URL validation permits known services and blocks private origins", (
 });
 
 test("segment validation accepts supported opaque IDs but rejects proxy schemes", () => {
+  assert.equal(internals.validateSegmentTarget("acfun", "acfun:38400001:0:60000"), true);
   assert.equal(internals.validateSegmentTarget("hongguo", "hongguo:v1:123:456:90#segment=0"), true);
   assert.equal(internals.validateSegmentTarget("dandan", "12345"), true);
   assert.equal(internals.validateSegmentTarget("qq", "https://dm.video.qq.com/barrage/test"), true);

@@ -43,6 +43,7 @@ import MaiduiduiSource from "../sources/maiduidui.js";
 import AiyifanSource from "../sources/aiyifan.js";
 import HongguoSource, { isHongguoPlayerUrl } from "../sources/hongguo.js";
 import AnimekoSource from "../sources/animeko.js";
+import AcfunSource from "../sources/acfun.js";
 import OtherSource from "../sources/other.js";
 import { Anime, AnimeMatch, Episodes, Bangumi } from "../models/dandan-model.js";
 
@@ -70,6 +71,7 @@ const maiduiduiSource = new MaiduiduiSource();
 const aiyifanSource = new AiyifanSource();
 const hongguoSource = new HongguoSource();
 const animekoSource = new AnimekoSource();
+const acfunSource = new AcfunSource();
 const otherSource = new OtherSource();
 const doubanSource = new DoubanSource(tencentSource, iqiyiSource, youkuSource, bilibiliSource, miguSource);
 const tmdbSource = new TmdbSource(doubanSource);
@@ -154,6 +156,8 @@ async function resolveUrlDuration(url) {
       segmentResult = await sourceLogContext.run('maiduidui', () => maiduiduiSource.getComments(targetUrl, 'maiduidui', true));
     } else if (targetUrl.includes('.yfsp.tv')) {
       segmentResult = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(targetUrl, 'aiyifan', true));
+    } else if (targetUrl.includes('.acfun.cn')) {
+      segmentResult = await sourceLogContext.run('acfun', () => acfunSource.getComments(targetUrl, 'acfun', true));
     }
 
     return extractDurationFromSegments(segmentResult);
@@ -358,7 +362,7 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
     hanjutv: animesHanjutv, bahamut: animesBahamut, dandan: animesDandan, custom: animesCustom,
     tencent: animesTencent, youku: animesYouku, iqiyi: animesIqiyi, imgo: animesImgo, bilibili: animesBilibili,
     migu: animesMigu, sohu: animesSohu, leshi: animesLeshi, xigua: animesXigua, maiduidui: animesMaiduidui,
-    aiyifan: animesAiyifan, hongguo: animesHongguo, animeko: animesAnimeko
+    aiyifan: animesAiyifan, hongguo: animesHongguo, animeko: animesAnimeko, acfun: animesAcfun
   } = resultData;
 
   // 仅处理resultData中存在数据的源，避免将undefined传入handleAnimes
@@ -444,6 +448,9 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
     } else if (key === 'animeko') {
       // 处理Animeko来源
       sourceTasks.push({ key, animes: isolatedAnimes, detailStore: isolatedDetailStore, promise: sourceLogContext.run(key, () => animekoSource.handleAnimes(animesAnimeko, queryTitle, isolatedAnimes, isolatedDetailStore, targetSeason)) });
+    } else if (key === 'acfun') {
+      // 处理AcFun来源
+      sourceTasks.push({ key, animes: isolatedAnimes, detailStore: isolatedDetailStore, promise: sourceLogContext.run(key, () => acfunSource.handleAnimes(animesAcfun, queryTitle, isolatedAnimes, isolatedDetailStore, targetSeason)) });
     }
   }
 
@@ -783,6 +790,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
       else if (source === "aiyifan") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => aiyifanSource.search(queryTitle));
       else if (source === "hongguo") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => hongguoSource.search(queryTitle));
       else if (source === "animeko") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => animekoSource.search(queryTitle));
+      else if (source === "acfun") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => acfunSource.search(queryTitle));
     }
 
     // 构建逐源管道：每个源 search 完成后，通过 executeSourceHandlers 处理 handleAnimes
@@ -1689,6 +1697,7 @@ function detectPlatformFromUrl(url) {
   if (url.includes('.douyin.com') || url.includes('.ixigua.com')) return 'xigua';
   if (url.includes('.mddcloud.com.cn')) return 'maiduidui';
   if (url.includes('.yfsp.tv')) return 'aiyifan';
+  if (url.includes('.acfun.cn')) return 'acfun';
   return 'unknown';
 }
 
@@ -2398,6 +2407,7 @@ async function fetchMergedComments(url, animeTitle, commentId) {
         else if (sourceName === 'aiyifan') sourceInstance = aiyifanSource;
         else if (sourceName === 'hongguo') sourceInstance = hongguoSource;
         else if (sourceName === 'animeko') sourceInstance = animekoSource;
+        else if (sourceName === 'acfun') sourceInstance = acfunSource;
         // 如有新增允许的源合并，在此处添加
 
         if (sourceInstance) {
@@ -2605,6 +2615,8 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
       danmus = await sourceLogContext.run('maiduidui', () => maiduiduiSource.getComments(commentUrl, plat, segmentFlag));
     } else if (url.includes('.yfsp.tv')) {
       danmus = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(commentUrl, plat, segmentFlag));
+    } else if (url.includes('.acfun.cn')) {
+      danmus = await sourceLogContext.run('acfun', () => acfunSource.getComments(commentUrl, 'acfun', segmentFlag));
     } else if (isHongguoPlayerUrl(commentUrl)) {
       danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(commentUrl, 'hongguo', segmentFlag));
     } else if (/(?:bgm|bangumi)\.(?:tv|lol)\/ep\/|chii\.in\/ep\//.test(url)) {
@@ -2630,6 +2642,8 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
         danmus = await sourceLogContext.run('custom', () => customSource.getComments(url, plat, segmentFlag));
       } else if (plat === "animeko") {
         danmus = await sourceLogContext.run('animeko', () => animekoSource.getComments(url, plat, segmentFlag));
+      } else if (plat === "acfun") {
+        danmus = await sourceLogContext.run('acfun', () => acfunSource.getComments(url, plat, segmentFlag));
       } else if (plat === "hongguo") {
         danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(url, plat, segmentFlag));
       }
@@ -2822,6 +2836,8 @@ export async function getCommentByUrl(videoUrl, queryFormat, segmentFlag, includ
       danmus = await sourceLogContext.run('maiduidui', () => maiduiduiSource.getComments(url, "maiduidui", segmentFlag));
     } else if (url.includes('.yfsp.tv')) {
       danmus = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(url, "aiyifan", segmentFlag));
+    } else if (url.includes('.acfun.cn')) {
+      danmus = await sourceLogContext.run('acfun', () => acfunSource.getComments(url, "acfun", segmentFlag));
     } else if (isHongguoPlayerUrl(url)) {
       danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(url, "hongguo", segmentFlag));
     } else {
@@ -2928,6 +2944,8 @@ export async function getSegmentComment(segment, queryFormat) {
       danmus = await sourceLogContext.run('dandan', () => dandanSource.getSegmentComments(segment));
     } else if (platform === "animeko") {
       danmus = await sourceLogContext.run('animeko', () => animekoSource.getSegmentComments(segment));
+    } else if (platform === "acfun") {
+      danmus = await sourceLogContext.run('acfun', () => acfunSource.getSegmentComments(segment));
     } else if (platform === "custom") {
       danmus = await sourceLogContext.run('custom', () => customSource.getSegmentComments(segment));
     } else if (platform === "other_server") {

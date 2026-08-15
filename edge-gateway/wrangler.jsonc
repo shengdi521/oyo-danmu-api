@@ -13,7 +13,7 @@
     }
   ],
   "vars": {
-    "SERVICE_VERSION": "2026.08.14"
+    "SERVICE_VERSION": "2026.08.15"
   },
   "vpc_services": [
     {

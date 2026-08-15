@@ -5,7 +5,7 @@ dotenv.config();
 import test from 'node:test';
 import assert from 'node:assert';
 import { handleRequest } from './worker.js';
-import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
+import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
 import { handleFavoriteRefresh } from './apis/favorite-api.js';
 import { handleClearCache } from './apis/system-api.js';
 import { getRedisCaches, getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry, updateRedisCaches } from "./utils/redis-util.js";
@@ -30,6 +30,7 @@ import MaiduiduiSource from "./sources/maiduidui.js";
 import AiyifanSource from "./sources/aiyifan.js";
 import HongguoSource, { parseHongguoPlayerUrl } from "./sources/hongguo.js";
 import AnimekoSource from "./sources/animeko.js";
+import AcfunSource from "./sources/acfun.js";
 import OtherSource from "./sources/other.js";
 import { httpGet, runWithRequestDeadline, settleUntilRequestDeadline } from "./utils/http-util.js";
 import { NodeHandler } from "./configs/handlers/node-handler.js";
@@ -181,6 +182,7 @@ test('worker.js API endpoints', async (t) => {
   const aiyifanSource = new AiyifanSource();
   const hongguoSource = new HongguoSource();
   const animekoSource = new AnimekoSource();
+  const acfunSource = new AcfunSource();
   const otherSource = new OtherSource();
 
   await t.test('GET / should return welcome message', async () => {
@@ -215,6 +217,125 @@ test('worker.js API endpoints', async (t) => {
       assert.equal(results[1].status, 'rejected');
       assert.equal(results[1].reason.name, 'AbortError');
       assert.ok(Date.now() - startedAt < 500);
+    });
+  });
+
+  await t.test('AcFun source completes search, episodes, and minute-segment comments', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'acfun',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '8000',
+    });
+
+    const calls = [];
+    await withMockFetch(async (url, options = {}) => {
+      const requestUrl = String(url);
+      calls.push({ url: requestUrl, method: options.method || 'GET', body: String(options.body || '') });
+
+      if (requestUrl.includes('/rest/pc-direct/search/bgm')) {
+        return mockJsonResponse({
+          result: 0,
+          bgmList: [{
+            id: 6140001,
+            bgmId: 6140001,
+            bgmTitle: 'AcFun测试番剧',
+            year: 2026,
+            coverImageV: 'https://example.com/acfun.jpg',
+            videoList: [
+              { id: 38400001, itemId: 2170001 },
+              { id: 38400002, itemId: 2170002 },
+            ],
+          }],
+        }, requestUrl);
+      }
+
+      if (requestUrl.includes('/bangumi/aa6140001_36188_2170001')) {
+        return {
+          ok: true,
+          status: 200,
+          url: requestUrl,
+          headers: new Headers({ 'content-type': 'text/html' }),
+          text: async () => '<script>{"videoId":38400001,"durationMillis":125000}</script>',
+        };
+      }
+
+      if (requestUrl.endsWith('/rest/pc-direct/new-danmaku/pollByPosition')) {
+        assert.match(String(options.body), /resourceId=38400001/);
+        assert.match(String(options.body), /positionFromInclude=0/);
+        assert.match(String(options.body), /positionToExclude=60000/);
+        return mockJsonResponse({
+          result: 0,
+          addCount: 1,
+          danmakus: [{
+            danmakuId: 90001,
+            body: 'AcFun分片弹幕',
+            position: 12345,
+            mode: 1,
+            color: 16777215,
+            likeCount: 2,
+          }],
+        }, requestUrl);
+      }
+
+      throw new Error(`Unexpected AcFun request: ${requestUrl}`);
+    }, async () => {
+      const detailStore = new Map();
+      const searchResponse = await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=AcFun%E6%B5%8B%E8%AF%95%E7%95%AA%E5%89%A7'),
+        null,
+        null,
+        detailStore
+      );
+      const searchBody = await parseResponse(searchResponse);
+      assert.equal(searchBody.success, true);
+      assert.equal(searchBody.animes.length, 1);
+      assert.equal(searchBody.animes[0].source, 'acfun');
+
+      const bangumiResponse = await getBangumi(`/api/v2/bangumi/${searchBody.animes[0].animeId}`, detailStore, 'acfun');
+      const bangumiBody = await parseResponse(bangumiResponse);
+      assert.equal(bangumiBody.bangumi.episodes.length, 2);
+      assert.match(bangumiBody.bangumi.episodes[0].episodeTitle, /acfun/);
+
+      const commentId = bangumiBody.bangumi.episodes[0].episodeId;
+      const segmentListResponse = await getComment(`/api/v2/comment/${commentId}`, 'json', true, '127.0.0.1');
+      const segmentListBody = await parseResponse(segmentListResponse);
+      assert.equal(segmentListBody.comments.duration, 125);
+      assert.equal(segmentListBody.comments.segmentList.length, 3);
+      assert.equal(new Set(segmentListBody.comments.segmentList.map((segment) => segment.url)).size, 3);
+
+      const segmentResponse = await getSegmentComment(segmentListBody.comments.segmentList[0], 'json');
+      const segmentBody = await parseResponse(segmentResponse);
+      assert.equal(segmentBody.count, 1);
+      assert.equal(segmentBody.comments[0].m, 'AcFun分片弹幕');
+      assert.equal(segmentBody.comments[0].like, 2);
+    });
+
+    assert(calls.some((call) => call.url.includes('/rest/pc-direct/search/bgm')));
+    assert(calls.some((call) => call.url.includes('/bangumi/aa6140001_36188_2170001')));
+    assert(calls.some((call) => call.url.endsWith('/rest/pc-direct/new-danmaku/pollByPosition')));
+    assert(acfunSource instanceof AcfunSource);
+  });
+
+  await t.test('AcFun search retries once after an aborted first connection', async () => {
+    const source = new AcfunSource();
+    let attempts = 0;
+
+    await withMockFetch(async (url) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new DOMException('AcFun first connection timed out', 'AbortError');
+      }
+
+      return mockJsonResponse({
+        result: 0,
+        bgmList: [{ bgmId: 6140002, bgmTitle: 'AcFun重试测试' }],
+      }, String(url));
+    }, async () => {
+      const results = await source.search('AcFun重试测试');
+      assert.equal(attempts, 2);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].bgmId, 6140002);
     });
   });
 

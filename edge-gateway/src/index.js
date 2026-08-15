@@ -47,7 +47,7 @@ const MEDIA_HOST_SUFFIXES = [
 ];
 
 const SAFE_SEGMENT_TYPES = new Set([
-  "aiyifan", "animeko", "bahamut", "bilibili1", "custom", "dandan", "hanjutv",
+  "acfun", "aiyifan", "animeko", "bahamut", "bilibili1", "custom", "dandan", "hanjutv",
   "hongguo", "imgo", "leshi", "maiduidui", "migu", "other_server", "qiyi", "qq",
   "renren", "sohu", "xigua", "youku",
 ]);
