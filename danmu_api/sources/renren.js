@@ -1065,7 +1065,31 @@ export default class RenrenSource extends BaseSource {
 
   async _getDetailLocal(id, episodeSid) {
     let detail = null;
-    const tiers = ['WEB', 'TV', 'MAC', 'WIN'];
+    let tiers = ['WEB', 'TV', 'MAC', 'WIN'];
+
+    // 空格回退若已由 TV 搜索命中，让 WEB 与 TV 详情竞速，避免串行详情
+    // 再次吃满搜索总截止时间。两个主接口都失败后再降级到 MAC/WIN。
+    if (API_HEALTH.detail === 'WEB' && API_HEALTH.search === 'TV') {
+      log("info", `[renren] TV 搜索已连通，并行竞速 WEB/TV 详情 (ID=${id})`);
+      const cancel = new AbortController();
+      const validDetail = (tier, promise) => Promise.resolve(promise).then((value) => {
+        if (!value) throw new Error(`${tier} detail unavailable`);
+        return { tier, value };
+      });
+
+      try {
+        const winner = await Promise.any([
+          validDetail('WEB', this.getWebDramaDetailFallback(String(id), cancel.signal)),
+          validDetail('TV', this.getAppDramaDetail(String(id), String(episodeSid), cancel.signal)),
+        ]);
+        cancel.abort();
+        API_HEALTH.detail = winner.tier;
+        return winner.value;
+      } catch (_) {
+        cancel.abort();
+        tiers = ['MAC', 'WIN'];
+      }
+    }
 
     let currentTierIndex = tiers.indexOf(API_HEALTH.detail);
     if (currentTierIndex === -1) currentTierIndex = 0;

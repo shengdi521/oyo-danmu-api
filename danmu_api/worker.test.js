@@ -262,6 +262,24 @@ test('worker.js API endpoints', async (t) => {
       await limitedSource._searchLocal('从下一接口继续', { maxTierAttempts: 1 });
       assert.deepEqual(limitedTierCalls, ['WIN', 'TV']);
 
+      const detailSource = new RenrenSource();
+      detailSource.performWinSearch = async () => null;
+      detailSource.searchAppContent = async () => [{ id: 'movie-1' }];
+      await detailSource._searchLocal('TV详情竞速准备');
+      const detailCalls = [];
+      detailSource.getWebDramaDetailFallback = async () => {
+        detailCalls.push('WEB');
+        return new Promise(() => {});
+      };
+      const tvDetail = { episodeList: [{ sid: 'episode-1' }] };
+      detailSource.getAppDramaDetail = async () => {
+        detailCalls.push('TV');
+        return tvDetail;
+      };
+      const racedDetail = await detailSource._getDetailLocal('movie-1');
+      assert.deepEqual(detailCalls, ['WEB', 'TV']);
+      assert.equal(racedDetail, tvDetail);
+
     } finally {
       Globals.deployPlatform = originalDeployPlatform;
     }
