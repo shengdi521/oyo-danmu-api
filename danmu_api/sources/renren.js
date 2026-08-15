@@ -641,36 +641,18 @@ export default class RenrenSource extends BaseSource {
       return Array.isArray(results) ? results : [];
     }
 
-    // 人人单次搜索可能接近多源搜索的总截止时间。稍晚预热空格变体，
-    // 既让快速的精确命中免于额外请求，也避免串行回退被总截止时间截断。
-    let fallbackPromise = null;
-    const startFallback = () => {
-      if (!fallbackPromise) {
-        fallbackPromise = Promise.resolve()
-          .then(() => searchOnce(spacedNumberKeyword))
-          .then(
-            (value) => ({ status: "fulfilled", value }),
-            (reason) => ({ status: "rejected", reason })
-          );
-      }
-      return fallbackPromise;
-    };
-    const fallbackTimer = setTimeout(() => void startFallback(), 250);
-
-    let primaryResults;
-    try {
-      primaryResults = await searchOnce(primaryKeyword);
-    } finally {
-      clearTimeout(fallbackTimer);
-    }
+    // Node 生产环境先给精确标题一次健康接口机会，避免完整降级链耗尽
+    // 多源搜索截止时间；未命中后再让空格变体走完整健康路由。
+    const primaryResults = isCloud
+      ? await this._searchCloud(primaryKeyword)
+      : await this._searchLocal(primaryKeyword, { maxTierAttempts: 1 });
     if (Array.isArray(primaryResults) && primaryResults.length > 0) {
       return primaryResults;
     }
 
     log("info", `[renren] 紧贴数字标题无结果，使用空格变体重试: ${spacedNumberKeyword}`);
-    const fallbackOutcome = await startFallback();
-    if (fallbackOutcome.status === "rejected") throw fallbackOutcome.reason;
-    return Array.isArray(fallbackOutcome.value) ? fallbackOutcome.value : [];
+    const fallbackResults = await searchOnce(spacedNumberKeyword);
+    return Array.isArray(fallbackResults) ? fallbackResults : [];
   }
 
   /**
@@ -743,17 +725,23 @@ export default class RenrenSource extends BaseSource {
   /**
    * 本地环境搜索：保持原有串行降级回路，沿用健康路由缓存
    */
-  async _searchLocal(keyword) {
+  async _searchLocal(keyword, { maxTierAttempts } = {}) {
     let allResults = [];
     let hasValidResponse = false;
 
     const tiers = ['WIN', 'TV', 'MAC', 'WEB'];
+    const tierAttemptLimit = Math.max(
+      1,
+      Math.min(tiers.length, Number(maxTierAttempts) || tiers.length)
+    );
+    let tierAttempts = 0;
     let currentTierIndex = tiers.indexOf(API_HEALTH.search);
     if (currentTierIndex === -1) currentTierIndex = 0;
 
     // 智能路由检测与降级回路
     for (let i = currentTierIndex; i < tiers.length; i++) {
         const tier = tiers[i];
+        tierAttempts++;
         log("info", `[renren] 尝试使用 ${tier} 端接口搜索`);
 
         try {
@@ -792,6 +780,8 @@ export default class RenrenSource extends BaseSource {
         } catch (e) {
             log("info", `[renren] ${tier} 端搜索异常，触发降级: ${e.message}`);
         }
+
+        if (tierAttempts >= tierAttemptLimit) break;
     }
 
     // 所有降级接口全部“异常报错”时，重置健康状态

@@ -249,22 +249,15 @@ test('worker.js API endpoints', async (t) => {
       await source.search('Scream6');
       assert.deepEqual(calls, ['Scream6']);
 
-      calls.length = 0;
-      let finishPrimary;
-      source._searchLocal = (keyword) => {
-        calls.push(keyword);
-        if (keyword === '惊声尖叫6') {
-          return new Promise((resolve) => { finishPrimary = resolve; });
-        }
-        return Promise.resolve([{ title: '惊声尖叫6' }]);
-      };
-      const pendingResults = source.search('惊声尖叫6');
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      const overlappedCalls = [...calls];
-      finishPrimary([]);
-      const overlappedResults = await pendingResults;
-      assert.deepEqual(overlappedCalls, ['惊声尖叫6', '惊声尖叫 6']);
-      assert.equal(overlappedResults.length, 1);
+      const limitedSource = new RenrenSource();
+      const limitedTierCalls = [];
+      limitedSource.performWinSearch = async () => { limitedTierCalls.push('WIN'); return null; };
+      limitedSource.searchAppContent = async () => { limitedTierCalls.push('TV'); return null; };
+      limitedSource.performMacSearch = async () => { limitedTierCalls.push('MAC'); return null; };
+      limitedSource.performNetworkSearch = async () => { limitedTierCalls.push('WEB'); return null; };
+      await limitedSource._searchLocal('单接口快速失败', { maxTierAttempts: 1 });
+      assert.equal(limitedTierCalls.length, 1);
+
     } finally {
       Globals.deployPlatform = originalDeployPlatform;
     }
