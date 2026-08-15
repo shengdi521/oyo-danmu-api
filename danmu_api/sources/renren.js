@@ -627,10 +627,30 @@ export default class RenrenSource extends BaseSource {
     log("info", `[renren] 开始搜索: ${keyword}`);
     const isCloud = globals.deployPlatform && globals.deployPlatform !== 'node';
 
-    if (isCloud) {
-      return this._searchCloud(keyword);
+    const primaryKeyword = String(keyword || "").trim();
+    const spacedNumberKeyword = primaryKeyword.replace(
+      /([\u3400-\u9FFF\uF900-\uFAFF])([0-9０-９]+)$/u,
+      "$1 $2"
+    );
+    const searchKeywords = spacedNumberKeyword !== primaryKeyword
+      ? [primaryKeyword, spacedNumberKeyword]
+      : [primaryKeyword];
+    let lastResults = [];
+
+    for (let index = 0; index < searchKeywords.length; index++) {
+      const searchKeyword = searchKeywords[index];
+      const results = isCloud
+        ? await this._searchCloud(searchKeyword)
+        : await this._searchLocal(searchKeyword);
+      if (Array.isArray(results)) lastResults = results;
+      if (lastResults.length > 0) return lastResults;
+
+      if (index === 0 && searchKeywords.length > 1) {
+        log("info", `[renren] 紧贴数字标题无结果，使用空格变体重试: ${spacedNumberKeyword}`);
+      }
     }
-    return this._searchLocal(keyword);
+
+    return lastResults;
   }
 
   /**

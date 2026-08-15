@@ -218,6 +218,41 @@ test('worker.js API endpoints', async (t) => {
     });
   });
 
+  await t.test('Renren retries a spaced trailing-number title only after an empty exact result', async () => {
+    const source = new RenrenSource();
+    const originalDeployPlatform = Globals.deployPlatform;
+    const calls = [];
+    Globals.deployPlatform = 'node';
+    source._searchLocal = async (keyword) => {
+      calls.push(keyword);
+      return keyword === '惊声尖叫 6' ? [{ title: '惊声尖叫6' }] : [];
+    };
+
+    try {
+      const fallbackResults = await source.search('惊声尖叫6');
+      assert.deepEqual(calls, ['惊声尖叫6', '惊声尖叫 6']);
+      assert.equal(fallbackResults.length, 1);
+
+      calls.length = 0;
+      source._searchLocal = async (keyword) => {
+        calls.push(keyword);
+        return [{ title: keyword }];
+      };
+      await source.search('斗罗大陆2');
+      assert.deepEqual(calls, ['斗罗大陆2']);
+
+      calls.length = 0;
+      source._searchLocal = async (keyword) => {
+        calls.push(keyword);
+        return [];
+      };
+      await source.search('Scream6');
+      assert.deepEqual(calls, ['Scream6']);
+    } finally {
+      Globals.deployPlatform = originalDeployPlatform;
+    }
+  });
+
   await t.test('FongMi comments use the public host, collapse the short path, and cap candidates', async () => {
     resetFavoriteState();
     const anime = createFavoriteAnime('FongMi反代测试', 80, 940001);
