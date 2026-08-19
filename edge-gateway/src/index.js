@@ -1,4 +1,5 @@
 const SERVICE_NAME = "oyo-danmu-api";
+const CACHE_SCHEMA_VERSION = "2";
 
 const PUBLIC_ROUTES = [
   { methods: new Set(["GET"]), pattern: /^\/api\/v2\/search\/(?:anime|episodes)\/?$/i },
@@ -79,6 +80,41 @@ function staleCacheKey(url) {
   return new Request(canonicalUrl(url, "stale.cache.invalid"), { method: "GET" });
 }
 
+async function sha256Hex(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function requestCacheKey(url, method, body = "", hostname = "cache.invalid") {
+  const canonical = canonicalUrl(url, hostname);
+  canonical.searchParams.set("__edge_cache_version", CACHE_SCHEMA_VERSION);
+  if (method === "POST") {
+    canonical.searchParams.set("__request_body_sha256", await sha256Hex(body));
+  }
+  return new Request(canonical, { method: "GET" });
+}
+
+async function responseIsCacheable(response, pathname, method) {
+  if (!response.ok) return false;
+  const needsSemanticValidation =
+    /\/api\/v2\/search\/(?:anime|episodes)(?:\/|$)/i.test(pathname) ||
+    (method === "POST" && /\/api\/v2\/segmentcomment(?:\/|$)/i.test(pathname));
+  if (!needsSemanticValidation) return true;
+
+  const contentLength = Number.parseInt(response.headers.get("content-length") || "0", 10);
+  if (Number.isFinite(contentLength) && contentLength > 2097152) return false;
+  try {
+    const payload = JSON.parse(await readBodyTextWithLimit(response.clone(), 2097152));
+    if (payload?.success === false || (payload?.errorCode && Number(payload.errorCode) !== 0)) return false;
+    if (/\/api\/v2\/search\/(?:anime|episodes)(?:\/|$)/i.test(pathname)) {
+      return Array.isArray(payload?.animes) && payload.animes.length > 0;
+    }
+    return Array.isArray(payload?.comments) && payload.comments.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function cacheStorageResponse(response, ttl) {
   const headers = new Headers(response.headers);
   headers.set("cache-control", `public, max-age=0, s-maxage=${ttl}`);
@@ -100,6 +136,7 @@ async function putCachedPair(cacheKey, backupKey, response, ttl) {
 }
 
 function cacheTtl(pathname, method) {
+  if (method === "POST" && /\/api\/v2\/segmentcomment(?:\/|$)/i.test(pathname)) return 1800;
   if (method !== "GET") return 0;
   if (/\/api\/v2\/(?:comment|extcomment|segmentcomment)(?:\/|$)/i.test(pathname)) return 1800;
   if (/\/api\/v2\/bangumi(?:\/|$)/i.test(pathname)) return 900;
@@ -159,6 +196,34 @@ function validateSegmentTarget(type, rawUrl) {
   return !/^(?:file|ftp|gopher|data|javascript|ws|wss):/i.test(rawUrl);
 }
 
+async function readBodyTextWithLimit(message, maxBytes) {
+  if (!message.body) return "";
+  const reader = message.body.getReader();
+  const chunks = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > maxBytes) {
+        await reader.cancel("request body too large");
+        throw new RangeError("request body too large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
 async function validateUrlInputs(request, url) {
   const queryUrl = url.searchParams.get("url");
   if (queryUrl && !validateMediaUrl(queryUrl)) {
@@ -173,13 +238,16 @@ async function validateUrlInputs(request, url) {
   }
   let body;
   try {
-    body = await request.text();
+    body = await readBodyTextWithLimit(request, 262144);
     const parsed = JSON.parse(body);
     if (!validateSegmentTarget(parsed?.type, parsed?.url)) throw new Error("unsupported URL");
-  } catch {
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return { ok: false, response: json({ success: false, errorMessage: "Request body too large" }, 413) };
+    }
     return { ok: false, response: json({ success: false, errorMessage: "Invalid segment request" }, 400) };
   }
-  return { ok: true, request: new Request(request, { body }) };
+  return { ok: true, request: new Request(request, { body }), body };
 }
 
 function corsPreflight() {
@@ -233,8 +301,12 @@ async function proxy(request, env, ctx, { management = false } = {}) {
   if (!validated.ok) return validated.response;
   request = validated.request;
   const ttl = management ? 0 : cacheTtl(incomingUrl.pathname, request.method);
-  const cacheKey = ttl > 0 ? new Request(canonicalUrl(incomingUrl), { method: "GET" }) : null;
-  const backupKey = ttl > 0 ? staleCacheKey(incomingUrl) : null;
+  const cacheKey = ttl > 0
+    ? await requestCacheKey(incomingUrl, request.method, validated.body || "")
+    : null;
+  const backupKey = ttl > 0
+    ? await requestCacheKey(incomingUrl, request.method, validated.body || "", "stale.cache.invalid")
+    : null;
   if (cacheKey) {
     const cached = await caches.default.match(cacheKey);
     if (cached) return decorate(cached, "HIT", ttl);
@@ -281,7 +353,11 @@ async function proxy(request, env, ctx, { management = false } = {}) {
       ctx.waitUntil((async () => {
         if (!(await checkRateLimit(env, `${ip}:REFRESH`))) return;
         const refreshed = await fetchFromOrigin();
-        if (refreshed.ok) await putCachedPair(cacheKey, backupKey, refreshed, ttl);
+        if (await responseIsCacheable(refreshed, incomingUrl.pathname, request.method)) {
+          await putCachedPair(cacheKey, backupKey, refreshed, ttl);
+        } else {
+          console.warn(JSON.stringify({ event: "cache_refresh_rejected", path: incomingUrl.pathname }));
+        }
       })().catch((error) => {
         console.error(JSON.stringify({ event: "stale_refresh_failed", message: String(error) }));
       }));
@@ -293,8 +369,18 @@ async function proxy(request, env, ctx, { management = false } = {}) {
     return json({ success: false, errorMessage: "Too many requests; retry shortly" }, 429, { "retry-after": "60" });
   }
   const response = await fetchFromOrigin();
-  if (cacheKey && response.ok) {
-    ctx.waitUntil(putCachedPair(cacheKey, backupKey, response, ttl).catch((error) => {
+  if (cacheKey) {
+    // Detach the cache candidate before returning the client response. Once the
+    // runtime starts streaming the client response, its body is locked and can
+    // no longer be cloned after asynchronous semantic validation finishes.
+    const cacheCandidate = response.clone();
+    ctx.waitUntil((async () => {
+      if (await responseIsCacheable(cacheCandidate, incomingUrl.pathname, request.method)) {
+        await putCachedPair(cacheKey, backupKey, cacheCandidate, ttl);
+      } else {
+        console.warn(JSON.stringify({ event: "cache_admission_rejected", path: incomingUrl.pathname }));
+      }
+    })().catch((error) => {
       console.error(JSON.stringify({ event: "cache_put_failed", message: String(error) }));
     }));
   }
@@ -327,7 +413,7 @@ async function health(request, env) {
   }, healthy ? 200 : 503);
 }
 
-export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, isPublicRoute, staleCacheKey, validateMediaUrl, validateSegmentTarget };
+export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, isPublicRoute, requestCacheKey, responseIsCacheable, staleCacheKey, validateMediaUrl, validateSegmentTarget };
 
 export default {
   async fetch(request, env, ctx) {

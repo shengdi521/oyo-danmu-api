@@ -18,9 +18,10 @@ function environment(overrides = {}) {
   };
 }
 
-test("cache TTLs only cover stable read APIs", () => {
+test("cache TTLs cover stable reads and validated segment POSTs", () => {
   assert.equal(internals.cacheTtl("/api/v2/comment/1", "GET"), 1800);
   assert.equal(internals.cacheTtl("/api/v2/search/anime", "GET"), 180);
+  assert.equal(internals.cacheTtl("/api/v2/segmentcomment", "POST"), 1800);
   assert.equal(internals.cacheTtl("/api/v2/match", "POST"), 0);
 });
 
@@ -31,6 +32,22 @@ test("canonical cache key sorts query parameters", () => {
     internals.staleCacheKey(new URL("https://danmu.oyo131.xyz/api/v2/search/anime?z=2&a=1")).url,
     "https://stale.cache.invalid/api/v2/search/anime?a=1&z=2",
   );
+});
+
+test("segment POST cache keys hash the validated body without exposing it", async () => {
+  const url = new URL("https://danmu.oyo131.xyz/api/v2/segmentcomment?format=json");
+  const firstBody = JSON.stringify({ type: "qq", url: "https://dm.video.qq.com/barrage/a" });
+  const secondBody = JSON.stringify({ type: "qq", url: "https://dm.video.qq.com/barrage/b" });
+  const first = await internals.requestCacheKey(url, "POST", firstBody);
+  const same = await internals.requestCacheKey(url, "POST", firstBody);
+  const second = await internals.requestCacheKey(url, "POST", secondBody);
+
+  assert.equal(first.url, same.url);
+  assert.notEqual(first.url, second.url);
+  assert.equal(first.method, "GET");
+  assert.match(first.url, /__edge_cache_version=2/);
+  assert.match(first.url, /__request_body_sha256=[a-f0-9]{64}/);
+  assert.equal(first.url.includes(encodeURIComponent(firstBody)), false);
 });
 
 test("media URL validation permits known services and blocks private origins", () => {
@@ -200,6 +217,166 @@ test("a cached read avoids both rate limiting and origin traffic", async () => {
   }
 });
 
+test("a cached segment POST avoids origin traffic and isolates requests by body", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  const seenKeys = [];
+  globalThis.caches = { default: {
+    async match(request) {
+      seenKeys.push(request.url);
+      return Response.json({ success: true, comments: [{ m: "cached segment" }] });
+    },
+    async put() {},
+  } };
+  globalThis.fetch = async () => { throw new Error("origin should not be called"); };
+  try {
+    const makeRequest = (url) => new Request("https://danmu.oyo131.xyz/api/v2/segmentcomment?format=json", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "qq", url }),
+    });
+    const first = await worker.fetch(makeRequest("https://dm.video.qq.com/barrage/a"), environment(), context());
+    const second = await worker.fetch(makeRequest("https://dm.video.qq.com/barrage/b"), environment(), context());
+
+    assert.equal(first.headers.get("x-edge-cache"), "HIT");
+    assert.equal(second.headers.get("x-edge-cache"), "HIT");
+    assert.equal(seenKeys.length, 2);
+    assert.notEqual(seenKeys[0], seenKeys[1]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
+});
+
+test("segment POST body limits apply even when content-length is absent", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  globalThis.caches = { default: {
+    async match() { throw new Error("cache should not be called"); },
+    async put() { throw new Error("cache should not be called"); },
+  } };
+  globalThis.fetch = async () => { throw new Error("origin should not be called"); };
+  try {
+    const request = new Request("https://danmu.oyo131.xyz/api/v2/segmentcomment", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "qq",
+        url: "https://dm.video.qq.com/barrage/a",
+        padding: "x".repeat(262144),
+      }),
+    });
+    assert.equal(request.headers.has("content-length"), false);
+    const response = await worker.fetch(request, environment(), context());
+    assert.equal(response.status, 413);
+    assert.equal((await response.json()).errorMessage, "Request body too large");
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
+});
+
+test("cache admission rejects empty search and segment results", async () => {
+  assert.equal(await internals.responseIsCacheable(
+    Response.json({ errorCode: 0, success: true, animes: [] }),
+    "/api/v2/search/anime",
+    "GET",
+  ), false);
+  assert.equal(await internals.responseIsCacheable(
+    Response.json({ errorCode: 0, success: true, animes: [{ animeId: 1 }] }),
+    "/api/v2/search/anime",
+    "GET",
+  ), true);
+  assert.equal(await internals.responseIsCacheable(
+    Response.json({ errorCode: 0, success: true, comments: [] }),
+    "/api/v2/segmentcomment",
+    "POST",
+  ), false);
+  assert.equal(await internals.responseIsCacheable(
+    Response.json({ errorCode: 0, success: true, comments: [{ m: "ok" }] }),
+    "/api/v2/segmentcomment",
+    "POST",
+  ), true);
+});
+
+test("cache admission rejects oversized semantic JSON without content-length", async () => {
+  const payload = JSON.stringify({
+    errorCode: 0,
+    success: true,
+    animes: [{ animeId: 1, padding: "x".repeat(2097152) }],
+  });
+  const response = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode(payload));
+      controller.close();
+    },
+  }), { headers: { "content-type": "application/json" } });
+
+  assert.equal(response.headers.has("content-length"), false);
+  assert.equal(await internals.responseIsCacheable(response, "/api/v2/search/anime", "GET"), false);
+});
+
+test("empty search responses never replace the cache", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  let writes = 0;
+  globalThis.caches = { default: {
+    async match() { return undefined; },
+    async put() { writes += 1; },
+  } };
+  globalThis.fetch = async () => Response.json({ errorCode: 0, success: true, animes: [] });
+  try {
+    const ctx = context();
+    const response = await worker.fetch(
+      new Request("https://danmu.oyo131.xyz/api/v2/search/anime?keyword=empty"),
+      environment(),
+      ctx,
+    );
+    assert.equal(response.status, 200);
+    await Promise.all(ctx.promises);
+    assert.equal(writes, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
+});
+
+test("cache writes use a detached response after the client stream is locked", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  let streamController;
+  let writes = 0;
+  globalThis.caches = { default: {
+    async match() { return undefined; },
+    async put() { writes += 1; },
+  } };
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    start(controller) { streamController = controller; },
+  }), { headers: { "content-type": "application/json" } });
+  try {
+    const ctx = context();
+    const response = await worker.fetch(
+      new Request("https://danmu.oyo131.xyz/api/v2/search/anime?keyword=stream-lock"),
+      environment(),
+      ctx,
+    );
+    const clientReader = response.body.getReader();
+    streamController.enqueue(new TextEncoder().encode(JSON.stringify({
+      errorCode: 0,
+      success: true,
+      animes: [{ animeId: 1 }],
+    })));
+    streamController.close();
+    await Promise.all(ctx.promises);
+
+    assert.equal(writes, 2);
+    await clientReader.cancel();
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
+});
+
 test("an expired fresh entry serves the long-lived backup and refreshes in the background", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
@@ -218,7 +395,7 @@ test("an expired fresh entry serves the long-lived backup and refreshes in the b
   } };
   globalThis.fetch = async () => {
     originCalls += 1;
-    return Response.json({ source: "refreshed" });
+    return Response.json({ success: true, animes: [{ source: "refreshed" }] });
   };
   try {
     const ctx = context();
