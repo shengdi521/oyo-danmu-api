@@ -815,7 +815,7 @@ export default class BilibiliSource extends BaseSource {
           return null;
         }
 
-        duration = data.data.duration;
+        duration = data.data.pages[p - 1].duration;
         cid = data.data.pages[p - 1].cid;
       } catch (error) {
         log("error", "[bilibili] 请求普通投稿视频信息失败:", error);
@@ -1098,10 +1098,20 @@ export default class BilibiliSource extends BaseSource {
 
       // 读取 URL Hash 中注入的元数据，就地执行区间截取与无缝时间轴拼接
       if (urlObj.hash && urlObj.hash.includes('combine_offset')) {
-        const hashParams = new URLSearchParams(urlObj.hash.substring(1));
-        const start = parseFloat(hashParams.get('combine_start')) || 0;
-        const end = parseFloat(hashParams.get('combine_end')) || 0;
-        const offset = parseFloat(hashParams.get('combine_offset')) || 0;
+        const hashParams = Object.create(null);
+        for (const pair of urlObj.hash.substring(1).split('&')) {
+          const separator = pair.indexOf('=');
+          const rawKey = separator >= 0 ? pair.slice(0, separator) : pair;
+          const rawValue = separator >= 0 ? pair.slice(separator + 1) : '';
+          try {
+            hashParams[decodeURIComponent(rawKey)] = decodeURIComponent(rawValue);
+          } catch {
+            hashParams[rawKey] = rawValue;
+          }
+        }
+        const start = parseFloat(hashParams.combine_start) || 0;
+        const end = parseFloat(hashParams.combine_end) || 0;
+        const offset = parseFloat(hashParams.combine_offset) || 0;
 
         const filtered = [];
 

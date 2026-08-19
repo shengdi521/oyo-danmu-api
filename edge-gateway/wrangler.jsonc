@@ -13,7 +13,10 @@
     }
   ],
   "vars": {
-    "SERVICE_VERSION": "2026.08.15"
+    "SERVICE_VERSION": "2026.08.19"
+  },
+  "secrets": {
+    "required": ["ADMIN_PATH_TOKEN", "ORIGIN_SHARED_SECRET"]
   },
   "vpc_services": [
     {

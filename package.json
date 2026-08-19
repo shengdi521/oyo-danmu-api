@@ -7,6 +7,7 @@
   "scripts": {
     "start": "node danmu_api/server.js",
     "test:edge": "node --test edge-gateway/test/*.test.js",
+    "test:forward-bundle": "node --test forward/forward-bundle.test.cjs",
     "edge:types": "wrangler types --config edge-gateway/wrangler.jsonc edge-gateway/worker-configuration.d.ts",
     "edge:dry-run": "wrangler deploy --dry-run --config edge-gateway/wrangler.jsonc --outdir edge-gateway/.wrangler/dry-run",
     "edge:deploy": "wrangler deploy --config edge-gateway/wrangler.jsonc",

@@ -27,11 +27,16 @@ test("cache TTLs only cover stable read APIs", () => {
 test("canonical cache key sorts query parameters", () => {
   const result = internals.canonicalUrl(new URL("https://danmu.oyo131.xyz/api/v2/search/anime?z=2&a=1"));
   assert.equal(result.href, "https://cache.invalid/api/v2/search/anime?a=1&z=2");
+  assert.equal(
+    internals.staleCacheKey(new URL("https://danmu.oyo131.xyz/api/v2/search/anime?z=2&a=1")).url,
+    "https://stale.cache.invalid/api/v2/search/anime?a=1&z=2",
+  );
 });
 
 test("media URL validation permits known services and blocks private origins", () => {
   assert.equal(internals.validateMediaUrl("https://v.qq.com/x/cover/test.html"), true);
   assert.equal(internals.validateMediaUrl("https://www.bilibili.com/video/BV1xx"), true);
+  assert.equal(internals.validateMediaUrl("https://www.nicovideo.jp/watch/sm9"), true);
   assert.equal(internals.validateMediaUrl("https://api5-normal-sinfonlinea.fqnovel.com/video/1"), false);
   assert.equal(internals.validateMediaUrl("https://attacker.example/proxy"), false);
   assert.equal(internals.validateMediaUrl("http://127.0.0.1:9321/private"), false);
@@ -42,6 +47,7 @@ test("segment validation accepts supported opaque IDs but rejects proxy schemes"
   assert.equal(internals.validateSegmentTarget("acfun", "acfun:38400001:0:60000"), true);
   assert.equal(internals.validateSegmentTarget("hongguo", "hongguo:v1:123:456:90#segment=0"), true);
   assert.equal(internals.validateSegmentTarget("dandan", "12345"), true);
+  assert.equal(internals.validateSegmentTarget("niconico", "niconico:sm9"), true);
   assert.equal(internals.validateSegmentTarget("qq", "https://dm.video.qq.com/barrage/test"), true);
   assert.equal(internals.validateSegmentTarget("qq", "http://127.0.0.1/private"), false);
   assert.equal(internals.validateSegmentTarget("unknown", "https://v.qq.com/video"), false);
@@ -188,6 +194,49 @@ test("a cached read avoids both rate limiting and origin traffic", async () => {
     );
     assert.equal(response.headers.get("x-edge-cache"), "HIT");
     assert.equal(limited, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    globalThis.caches = originalCaches;
+  }
+});
+
+test("an expired fresh entry serves the long-lived backup and refreshes in the background", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  const writes = [];
+  let originCalls = 0;
+  globalThis.caches = { default: {
+    async match(request) {
+      if (new URL(request.url).hostname === "stale.cache.invalid") {
+        return Response.json({ source: "backup" });
+      }
+      return undefined;
+    },
+    async put(request, response) {
+      writes.push({ url: request.url, cacheControl: response.headers.get("cache-control") });
+    },
+  } };
+  globalThis.fetch = async () => {
+    originCalls += 1;
+    return Response.json({ source: "refreshed" });
+  };
+  try {
+    const ctx = context();
+    const response = await worker.fetch(
+      new Request("https://danmu.oyo131.xyz/api/v2/search/anime?keyword=test"),
+      environment(),
+      ctx,
+    );
+    assert.equal(response.headers.get("x-edge-cache"), "STALE");
+    assert.deepEqual(await response.json(), { source: "backup" });
+    assert(writes.length >= 1, "backup is promoted briefly before returning");
+    assert.match(writes[0].cacheControl, /s-maxage=15/);
+
+    await Promise.all(ctx.promises);
+    assert.equal(originCalls, 1);
+    assert.equal(writes.length, 3, "background refresh updates fresh and backup entries");
+    assert(writes.some((entry) => entry.url.startsWith("https://stale.cache.invalid/")));
+    assert(writes.some((entry) => /s-maxage=86400/.test(entry.cacheControl)));
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.caches = originalCaches;

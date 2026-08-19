@@ -44,6 +44,7 @@ import AiyifanSource from "../sources/aiyifan.js";
 import HongguoSource, { isHongguoPlayerUrl } from "../sources/hongguo.js";
 import AnimekoSource from "../sources/animeko.js";
 import AcfunSource from "../sources/acfun.js";
+import NiconicoSource from "../sources/niconico.js";
 import OtherSource from "../sources/other.js";
 import { Anime, AnimeMatch, Episodes, Bangumi } from "../models/dandan-model.js";
 
@@ -72,6 +73,7 @@ const aiyifanSource = new AiyifanSource();
 const hongguoSource = new HongguoSource();
 const animekoSource = new AnimekoSource();
 const acfunSource = new AcfunSource();
+const niconicoSource = new NiconicoSource();
 const otherSource = new OtherSource();
 const doubanSource = new DoubanSource(tencentSource, iqiyiSource, youkuSource, bilibiliSource, miguSource);
 const tmdbSource = new TmdbSource(doubanSource);
@@ -158,6 +160,8 @@ async function resolveUrlDuration(url) {
       segmentResult = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(targetUrl, 'aiyifan', true));
     } else if (targetUrl.includes('.acfun.cn')) {
       segmentResult = await sourceLogContext.run('acfun', () => acfunSource.getComments(targetUrl, 'acfun', true));
+    } else if (targetUrl.includes('.nicovideo.jp')) {
+      segmentResult = await sourceLogContext.run('niconico', () => niconicoSource.getComments(targetUrl, 'niconico', true));
     }
 
     return extractDurationFromSegments(segmentResult);
@@ -362,7 +366,8 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
     hanjutv: animesHanjutv, bahamut: animesBahamut, dandan: animesDandan, custom: animesCustom,
     tencent: animesTencent, youku: animesYouku, iqiyi: animesIqiyi, imgo: animesImgo, bilibili: animesBilibili,
     migu: animesMigu, sohu: animesSohu, leshi: animesLeshi, xigua: animesXigua, maiduidui: animesMaiduidui,
-    aiyifan: animesAiyifan, hongguo: animesHongguo, animeko: animesAnimeko, acfun: animesAcfun
+    aiyifan: animesAiyifan, hongguo: animesHongguo, animeko: animesAnimeko, acfun: animesAcfun,
+    niconico: animesNiconico
   } = resultData;
 
   // 仅处理resultData中存在数据的源，避免将undefined传入handleAnimes
@@ -451,6 +456,9 @@ async function executeSourceHandlers(resultData, queryTitle, targetAnimesList, r
     } else if (key === 'acfun') {
       // 处理AcFun来源
       sourceTasks.push({ key, animes: isolatedAnimes, detailStore: isolatedDetailStore, promise: sourceLogContext.run(key, () => acfunSource.handleAnimes(animesAcfun, queryTitle, isolatedAnimes, isolatedDetailStore, targetSeason)) });
+    } else if (key === 'niconico') {
+      // 处理 Niconico 官方公开搜索、系列分集与 nvComment 弹幕
+      sourceTasks.push({ key, animes: isolatedAnimes, detailStore: isolatedDetailStore, promise: sourceLogContext.run(key, () => niconicoSource.handleAnimes(animesNiconico, queryTitle, isolatedAnimes, isolatedDetailStore, targetSeason)) });
     }
   }
 
@@ -791,6 +799,7 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
       else if (source === "hongguo") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => hongguoSource.search(queryTitle));
       else if (source === "animeko") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => animekoSource.search(queryTitle));
       else if (source === "acfun") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => acfunSource.search(queryTitle));
+      else if (source === "niconico") sourceSearchMap[source] = sourceLogContext.run(toLogSourceName(source), () => niconicoSource.search(queryTitle));
     }
 
     // 构建逐源管道：每个源 search 完成后，通过 executeSourceHandlers 处理 handleAnimes
@@ -1087,10 +1096,12 @@ function findEpisodeByNumber(filteredEpisodes, episode, targetEpisode, platform 
   }
 
   // 策略2：使用数组索引
-  if (platformEpisodes.length >= targetEpisode) {
+  if (targetEpisode > 0 && platformEpisodes.length >= targetEpisode) {
     const fallbackEp = platformEpisodes[targetEpisode - 1];
-    log("info", `Using fallback array index for episode ${targetEpisode}: ${fallbackEp.episodeTitle}`);
-    return fallbackEp;
+    if (fallbackEp) {
+      log("info", `Using fallback array index for episode ${targetEpisode}: ${fallbackEp.episodeTitle}`);
+      return fallbackEp;
+    }
   }
   
   // 策略3：使用episodeNumber字段匹配
@@ -1356,19 +1367,21 @@ function findCrossSeasonEpisodeMap(searchData, title, year, season, episode, pla
       break;
     }
 
-    if (currentTargetEpisode <= allEps.length) {
+    if (currentTargetEpisode > 0 && currentTargetEpisode <= allEps.length) {
       const targetEp = allEps[currentTargetEpisode - 1];
-      if (platform && getPlatformMatchScore(extractEpisodeTitle(targetEp.episodeTitle), platform) === 0) {
-        currentSeason++;
-        continue;
+      if (targetEp) {
+        if (platform && getPlatformMatchScore(extractEpisodeTitle(targetEp.episodeTitle), platform) === 0) {
+          currentSeason++;
+          continue;
+        }
+        log("info", `[system] [spillover] 跨季溢出查找命中 (按相对排位计算) -> 所在季：S${currentSeason} 集标题：${targetEp.episodeTitle}`);
+        bestRes = {
+          anime: seasonData.anime,
+          episode: targetEp,
+          score: platform ? getPlatformMatchScore(seasonData.actualPlatform, platform) : 1
+        };
+        break;
       }
-      log("info", `[system] [spillover] 跨季溢出查找命中 (按相对排位计算) -> 所在季：S${currentSeason} 集标题：${targetEp.episodeTitle}`);
-      bestRes = {
-        anime: seasonData.anime,
-        episode: targetEp,
-        score: platform ? getPlatformMatchScore(seasonData.actualPlatform, platform) : 1
-      };
-      break;
     }
 
     // 目标集号超出实际集数但仍落在该季 TMDB 标准区间内: 真实集数偏短时返回该季最后一集, 避免无谓顺延至后续季
@@ -2088,10 +2101,10 @@ export async function matchAnime(url, req, clientIp) {
     // 示例返回
     return jsonResponse(resData);
   } catch (error) {
-    // 处理 JSON 解析错误或其他异常
-    log("error", `[system] [match] Failed to parse request body: ${error.message}`);
+    // 处理匹配请求中的异常
+    log("error", `[system] [match] Error processing match request: ${error.stack || error.message}`);
     return jsonResponse(
-      { errorCode: 400, success: false, errorMessage: "Invalid JSON body" },
+      { errorCode: 400, success: false, errorMessage: error.message || "Invalid JSON body" },
       400
     );
   }
@@ -2408,6 +2421,7 @@ async function fetchMergedComments(url, animeTitle, commentId) {
         else if (sourceName === 'hongguo') sourceInstance = hongguoSource;
         else if (sourceName === 'animeko') sourceInstance = animekoSource;
         else if (sourceName === 'acfun') sourceInstance = acfunSource;
+        else if (sourceName === 'niconico') sourceInstance = niconicoSource;
         // 如有新增允许的源合并，在此处添加
 
         if (sourceInstance) {
@@ -2617,6 +2631,8 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
       danmus = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(commentUrl, plat, segmentFlag));
     } else if (url.includes('.acfun.cn')) {
       danmus = await sourceLogContext.run('acfun', () => acfunSource.getComments(commentUrl, 'acfun', segmentFlag));
+    } else if (url.includes('.nicovideo.jp')) {
+      danmus = await sourceLogContext.run('niconico', () => niconicoSource.getComments(commentUrl, 'niconico', segmentFlag));
     } else if (isHongguoPlayerUrl(commentUrl)) {
       danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(commentUrl, 'hongguo', segmentFlag));
     } else if (/(?:bgm|bangumi)\.(?:tv|lol)\/ep\/|chii\.in\/ep\//.test(url)) {
@@ -2644,6 +2660,8 @@ export async function getComment(path, queryFormat, segmentFlag, clientIp, inclu
         danmus = await sourceLogContext.run('animeko', () => animekoSource.getComments(url, plat, segmentFlag));
       } else if (plat === "acfun") {
         danmus = await sourceLogContext.run('acfun', () => acfunSource.getComments(url, plat, segmentFlag));
+      } else if (plat === "niconico") {
+        danmus = await sourceLogContext.run('niconico', () => niconicoSource.getComments(url, plat, segmentFlag));
       } else if (plat === "hongguo") {
         danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(url, plat, segmentFlag));
       }
@@ -2838,6 +2856,8 @@ export async function getCommentByUrl(videoUrl, queryFormat, segmentFlag, includ
       danmus = await sourceLogContext.run('aiyifan', () => aiyifanSource.getComments(url, "aiyifan", segmentFlag));
     } else if (url.includes('.acfun.cn')) {
       danmus = await sourceLogContext.run('acfun', () => acfunSource.getComments(url, "acfun", segmentFlag));
+    } else if (url.includes('.nicovideo.jp')) {
+      danmus = await sourceLogContext.run('niconico', () => niconicoSource.getComments(url, "niconico", segmentFlag));
     } else if (isHongguoPlayerUrl(url)) {
       danmus = await sourceLogContext.run('hongguo', () => hongguoSource.getComments(url, "hongguo", segmentFlag));
     } else {
@@ -2946,6 +2966,8 @@ export async function getSegmentComment(segment, queryFormat) {
       danmus = await sourceLogContext.run('animeko', () => animekoSource.getSegmentComments(segment));
     } else if (platform === "acfun") {
       danmus = await sourceLogContext.run('acfun', () => acfunSource.getSegmentComments(segment));
+    } else if (platform === "niconico") {
+      danmus = await sourceLogContext.run('niconico', () => niconicoSource.getSegmentComments(segment));
     } else if (platform === "custom") {
       danmus = await sourceLogContext.run('custom', () => customSource.getSegmentComments(segment));
     } else if (platform === "other_server") {

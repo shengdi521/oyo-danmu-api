@@ -61,6 +61,11 @@ const forwardRuntimeCompatPlugin = {
       namespace: 'forward-node-builtins'
     }));
 
+    build.onResolve({ filter: /^node:(?:http|https)$/ }, (args) => ({
+      path: args.path.slice('node:'.length),
+      namespace: 'forward-node-builtins'
+    }));
+
     // brotli ships a compressed dictionary specifically for browser bundles.
     build.onResolve({ filter: /^\.\/dictionary-data$/ }, (args) => {
       if (/[\\/]node_modules[\\/]brotli[\\/]dec[\\/]dictionary\.js$/.test(args.importer)) {
@@ -187,6 +192,7 @@ const forwardRuntimeCompatPlugin = {
       define: {
         'widgetVersion': `"${Globals.VERSION}"`,
         'globalThis.__FORWARD_WIDGET_RUNTIME__': 'true',
+        'globalThis.__FORWARD_WIDGET__': 'true',
         'globalThis.__FORWARD_WIDGET_DEBUG__': debugBuild ? 'true' : 'false'
       },
       banner: {

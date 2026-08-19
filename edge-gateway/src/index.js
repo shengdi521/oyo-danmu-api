@@ -42,13 +42,13 @@ const MEDIA_HOST_SUFFIXES = [
   "bilibili.com", "bilivideo.com", "douban.com", "doubanio.com", "douyin.com",
   "gamer.com.tw", "hiyun.tv", "hunantv.com", "iq.com", "iqiyi.com", "ixigua.com",
   "le.com", "letv.com", "mddcloud.com.cn", "mgtv.com", "migu.cn", "miguvideo.com",
-  "myani.org", "qq.com", "rrsp.com.cn", "snssdk.com", "sohu.com", "tv.sohu.com",
+  "myani.org", "nimg.jp", "nicovideo.jp", "qq.com", "rrsp.com.cn", "snssdk.com", "sohu.com", "tv.sohu.com",
   "xiawen.tv", "yfsp.tv", "ykimg.com", "youku.com", "zmdcq.com",
 ];
 
 const SAFE_SEGMENT_TYPES = new Set([
   "acfun", "aiyifan", "animeko", "bahamut", "bilibili1", "custom", "dandan", "hanjutv",
-  "hongguo", "imgo", "leshi", "maiduidui", "migu", "other_server", "qiyi", "qq",
+  "hongguo", "imgo", "leshi", "maiduidui", "migu", "niconico", "other_server", "qiyi", "qq",
   "renren", "sohu", "xigua", "youku",
 ]);
 
@@ -65,14 +65,38 @@ function json(data, status = 200, extraHeaders = {}) {
   });
 }
 
-function canonicalUrl(url) {
-  const canonical = new URL("https://cache.invalid");
+function canonicalUrl(url, hostname = "cache.invalid") {
+  const canonical = new URL(`https://${hostname}`);
   canonical.pathname = url.pathname;
   const entries = [...url.searchParams.entries()].sort(([aKey, aValue], [bKey, bValue]) =>
     aKey === bKey ? aValue.localeCompare(bValue) : aKey.localeCompare(bKey),
   );
   for (const [key, value] of entries) canonical.searchParams.append(key, value);
   return canonical;
+}
+
+function staleCacheKey(url) {
+  return new Request(canonicalUrl(url, "stale.cache.invalid"), { method: "GET" });
+}
+
+function cacheStorageResponse(response, ttl) {
+  const headers = new Headers(response.headers);
+  headers.set("cache-control", `public, max-age=0, s-maxage=${ttl}`);
+  headers.delete("x-edge-cache");
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+async function putCachedPair(cacheKey, backupKey, response, ttl) {
+  const fresh = cacheStorageResponse(response.clone(), ttl);
+  const backup = cacheStorageResponse(response.clone(), 86400);
+  await Promise.all([
+    caches.default.put(cacheKey, fresh),
+    caches.default.put(backupKey, backup),
+  ]);
 }
 
 function cacheTtl(pathname, method) {
@@ -210,43 +234,67 @@ async function proxy(request, env, ctx, { management = false } = {}) {
   request = validated.request;
   const ttl = management ? 0 : cacheTtl(incomingUrl.pathname, request.method);
   const cacheKey = ttl > 0 ? new Request(canonicalUrl(incomingUrl), { method: "GET" }) : null;
+  const backupKey = ttl > 0 ? staleCacheKey(incomingUrl) : null;
   if (cacheKey) {
     const cached = await caches.default.match(cacheKey);
     if (cached) return decorate(cached, "HIT", ttl);
   }
   const ip = clientIp(request);
+
+  const fetchFromOrigin = async () => {
+    const originUrl = new URL(request.url);
+    originUrl.protocol = "http:";
+    originUrl.hostname = "danmu.internal";
+    originUrl.port = "";
+    const headers = new Headers(request.headers);
+    headers.delete("host");
+    headers.delete("content-length");
+    headers.delete("x-danmu-origin-auth");
+    headers.set("x-danmu-origin-auth", env.ORIGIN_SHARED_SECRET);
+    headers.set("x-forwarded-proto", "https");
+    headers.set("x-forwarded-host", incomingUrl.host);
+    headers.set("x-real-ip", ip);
+    headers.set("x-forwarded-for", ip);
+    const upstreamRequest = new Request(originUrl, {
+      method: request.method,
+      headers,
+      body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+      redirect: "manual",
+    });
+    try {
+      const upstream = await env.ORIGIN.fetch(upstreamRequest, { cache: "no-store" });
+      return decorate(upstream, "MISS", ttl, management);
+    } catch (error) {
+      console.error(JSON.stringify({ event: "origin_fetch_failed", message: String(error) }));
+      return json({ success: false, errorMessage: "Origin temporarily unavailable" }, 503, { "retry-after": "5" });
+    }
+  };
+
+  if (backupKey) {
+    const backup = await caches.default.match(backupKey);
+    if (backup) {
+      const promoted = cacheStorageResponse(backup.clone(), 15);
+      const response = decorate(backup, "STALE", ttl);
+      // Promote the backup briefly before returning so concurrent misses do not
+      // stampede the 512 MB origin while one background refresh is running.
+      await caches.default.put(cacheKey, promoted);
+      ctx.waitUntil((async () => {
+        if (!(await checkRateLimit(env, `${ip}:REFRESH`))) return;
+        const refreshed = await fetchFromOrigin();
+        if (refreshed.ok) await putCachedPair(cacheKey, backupKey, refreshed, ttl);
+      })().catch((error) => {
+        console.error(JSON.stringify({ event: "stale_refresh_failed", message: String(error) }));
+      }));
+      return response;
+    }
+  }
+
   if (!(await checkRateLimit(env, `${ip}:${request.method}`))) {
     return json({ success: false, errorMessage: "Too many requests; retry shortly" }, 429, { "retry-after": "60" });
   }
-  const originUrl = new URL(request.url);
-  originUrl.protocol = "http:";
-  originUrl.hostname = "danmu.internal";
-  originUrl.port = "";
-  const headers = new Headers(request.headers);
-  headers.delete("host");
-  headers.delete("content-length");
-  headers.delete("x-danmu-origin-auth");
-  headers.set("x-danmu-origin-auth", env.ORIGIN_SHARED_SECRET);
-  headers.set("x-forwarded-proto", "https");
-  headers.set("x-forwarded-host", incomingUrl.host);
-  headers.set("x-real-ip", ip);
-  headers.set("x-forwarded-for", ip);
-  const upstreamRequest = new Request(originUrl, {
-    method: request.method,
-    headers,
-    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
-    redirect: "manual",
-  });
-  let upstream;
-  try {
-    upstream = await env.ORIGIN.fetch(upstreamRequest, { cache: "no-store" });
-  } catch (error) {
-    console.error(JSON.stringify({ event: "origin_fetch_failed", message: String(error) }));
-    return json({ success: false, errorMessage: "Origin temporarily unavailable" }, 503, { "retry-after": "5" });
-  }
-  const response = decorate(upstream, "MISS", ttl, management);
+  const response = await fetchFromOrigin();
   if (cacheKey && response.ok) {
-    ctx.waitUntil(caches.default.put(cacheKey, response.clone()).catch((error) => {
+    ctx.waitUntil(putCachedPair(cacheKey, backupKey, response, ttl).catch((error) => {
       console.error(JSON.stringify({ event: "cache_put_failed", message: String(error) }));
     }));
   }
@@ -279,7 +327,7 @@ async function health(request, env) {
   }, healthy ? 200 : 503);
 }
 
-export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, isPublicRoute, validateMediaUrl, validateSegmentTarget };
+export const internals = { cacheTtl, canonicalUrl, hostnameAllowed, isPublicRoute, staleCacheKey, validateMediaUrl, validateSegmentTarget };
 
 export default {
   async fetch(request, env, ctx) {
