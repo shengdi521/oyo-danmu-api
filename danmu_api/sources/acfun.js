@@ -9,10 +9,13 @@ import { titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitl
 import { SegmentListResponse } from '../models/dandan-model.js';
 
 const ACFUN_BASE_URL = 'https://www.acfun.cn';
+const ACFUN_BGM_SEARCH_URL = `${ACFUN_BASE_URL}/rest/pc-direct/search/bgm`;
+const ACFUN_VIDEO_SEARCH_URL = `${ACFUN_BASE_URL}/rest/pc-direct/search/video`;
 const ACFUN_DANMU_LIST_URL = `${ACFUN_BASE_URL}/rest/pc-direct/new-danmaku/list`;
 const ACFUN_DANMU_POSITION_URL = `${ACFUN_BASE_URL}/rest/pc-direct/new-danmaku/pollByPosition`;
 const SEGMENT_DURATION_MS = 60 * 1000;
 const MAX_DANMU_PAGES = 100;
+const MAX_VIDEO_FALLBACK_RESULTS = 12;
 
 function toFormBody(values) {
   return Object.entries(values)
@@ -31,7 +34,7 @@ export default class AcfunSource extends BaseSource {
 
   async search(keyword) {
     try {
-      const targetUrl = `${ACFUN_BASE_URL}/rest/pc-direct/search/bgm?keyword=${encodeURIComponent(keyword)}`;
+      const targetUrl = `${ACFUN_BGM_SEARCH_URL}?keyword=${encodeURIComponent(keyword)}`;
       const response = await httpGet(globals.makeProxyUrl(targetUrl), {
         headers: this.headers,
         timeout: 3000,
@@ -39,8 +42,47 @@ export default class AcfunSource extends BaseSource {
       });
       const data = response?.data;
       const results = Array.isArray(data?.bgmList) ? data.bgmList : [];
-      log('info', `[acfun] 搜索找到 ${results.length} 个有效结果`);
-      return results;
+      if (results.length > 0) {
+        log('info', `[acfun] 番剧搜索找到 ${results.length} 个有效结果`);
+        return results;
+      }
+
+      // AcFun 的番剧搜索接口在部分时期会正常返回 200 但没有 bgmList。
+      // 此时降级到公开视频搜索，只保留实际带有弹幕的数据，避免无弹幕短视频污染结果。
+      const videoUrl = `${ACFUN_VIDEO_SEARCH_URL}?keyword=${encodeURIComponent(keyword)}&pCursor=1&requestId=`;
+      const videoResponse = await httpGet(globals.makeProxyUrl(videoUrl), {
+        headers: this.headers,
+        timeout: 3000,
+        retries: 1,
+      });
+      const videos = Array.isArray(videoResponse?.data?.videoList) ? videoResponse.data.videoList : [];
+      const fallbackResults = videos
+        .filter((video) => Number(video?.videoId || 0) > 0)
+        .filter((video) => Number(video?.contentId || video?.id || 0) > 0)
+        .filter((video) => Number(video?.danmuCount || 0) > 0)
+        .slice(0, MAX_VIDEO_FALLBACK_RESULTS)
+        .map((video) => {
+          const contentId = Number(video.contentId || video.id);
+          const createdAt = Number(video.ctime || 0);
+          const year = createdAt > 0 ? new Date(createdAt).getUTCFullYear() : 0;
+          const title = String(video.title || '').trim();
+          return {
+            id: contentId,
+            bgmId: contentId,
+            bgmTitle: title,
+            year,
+            coverImageV: video.coverUrl || '',
+            oyoVideoFallback: true,
+            videoList: [{
+              id: Number(video.videoId),
+              itemId: contentId,
+              episodeName: title,
+            }],
+          };
+        })
+        .filter((video) => video.bgmTitle);
+      log('info', `[acfun] 番剧搜索为空，公开视频降级找到 ${fallbackResults.length} 个带弹幕结果`);
+      return fallbackResults;
     } catch (error) {
       log('error', `[acfun] 搜索失败: ${error.message}`);
       return [];
@@ -77,6 +119,7 @@ export default class AcfunSource extends BaseSource {
     for (const anime of filteredAnimes) {
       const episodes = await this.getEpisodes(anime);
       const bgmId = Number(anime?.bgmId || anime?.id || 0);
+      const isVideoFallback = anime?.oyoVideoFallback === true;
       if (!bgmId || episodes.length === 0) continue;
 
       const links = episodes.flatMap((episode, index) => {
@@ -84,9 +127,12 @@ export default class AcfunSource extends BaseSource {
         const itemId = Number(episode?.itemId || 0);
         if (!videoId || !itemId) return [];
         const episodeTitle = episode?.episodeName || episode?.title || `第${index + 1}集`;
+        const pageUrl = isVideoFallback
+          ? `${ACFUN_BASE_URL}/v/ac${itemId}`
+          : `${ACFUN_BASE_URL}/bangumi/aa${bgmId}_36188_${itemId}`;
         return [{
           name: String(episodeTitle),
-          url: `${ACFUN_BASE_URL}/bangumi/aa${bgmId}_36188_${itemId}?oyo_acfun_vid=${videoId}`,
+          url: `${pageUrl}?oyo_acfun_vid=${videoId}`,
           title: `【acfun】 ${episodeTitle}`,
         }];
       });
@@ -94,7 +140,7 @@ export default class AcfunSource extends BaseSource {
 
       const year = Number(anime?.year || 0);
       const title = String(anime?.bgmTitle || anime?.title || '').trim();
-      const animeId = convertToAsciiSum(`acfun:${bgmId}`);
+      const animeId = convertToAsciiSum(`acfun:${isVideoFallback ? 'video:' : ''}${bgmId}`);
       const transformedAnime = {
         animeId,
         bangumiId: String(bgmId),
@@ -114,7 +160,14 @@ export default class AcfunSource extends BaseSource {
       if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
     }
 
-    this.sortAndPushAnimesByYear(transformed, curAnimes);
+    if (filteredAnimes.some((anime) => anime?.oyoVideoFallback === true)) {
+      // 视频降级结果使用 AcFun 自身的相关性排序，避免较新的无关剪辑压过更匹配的旧视频。
+      transformed.forEach((anime) => {
+        if (!curAnimes.some((existing) => existing.animeId === anime.animeId)) curAnimes.push(anime);
+      });
+    } else {
+      this.sortAndPushAnimesByYear(transformed, curAnimes);
+    }
     return transformed;
   }
 

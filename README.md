@@ -616,6 +616,8 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | niconico | [Niconico](https://www.nicovideo.jp/) |
 | custom   | custom |
 
+AcFun 会优先使用番剧搜索；当官方番剧接口返回空列表时，自动降级到公开视频搜索，并只保留标题匹配、实际带弹幕的视频。该降级源建议与 Niconico 一样放在 `SOURCE_ORDER` 末尾。
+
 ## 项目结构
 ```
 ├── .gitignore

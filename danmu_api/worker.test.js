@@ -496,6 +496,78 @@ test('worker.js API endpoints', async (t) => {
     });
   });
 
+  await t.test('AcFun falls back to danmaku-bearing videos when the bangumi search is empty', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'acfun',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '8000',
+    });
+
+    const calls = [];
+    await withMockFetch(async (url) => {
+      const requestUrl = String(url);
+      calls.push(requestUrl);
+
+      if (requestUrl.includes('/rest/pc-direct/search/bgm')) {
+        return mockJsonResponse({ result: 0, totalNum: 0 }, requestUrl);
+      }
+      if (requestUrl.includes('/rest/pc-direct/search/video')) {
+        return mockJsonResponse({
+          result: 0,
+          totalNum: 3,
+          videoList: [
+            {
+              contentId: 4242001,
+              videoId: '9900001',
+              title: 'AcFun后备视频',
+              ctime: Date.UTC(2026, 0, 2),
+              coverUrl: 'https://example.com/acfun-video.jpg',
+              danmuCount: 18,
+            },
+            {
+              contentId: 4242002,
+              videoId: '9900002',
+              title: 'AcFun后备视频较新剪辑',
+              ctime: Date.UTC(2027, 0, 1),
+              coverUrl: 'https://example.com/acfun-newer.jpg',
+              danmuCount: 10,
+            },
+            {
+              contentId: 4242003,
+              videoId: '9900003',
+              title: 'AcFun后备视频无弹幕版',
+              ctime: Date.UTC(2028, 0, 1),
+              coverUrl: 'https://example.com/acfun-empty.jpg',
+              danmuCount: 0,
+            },
+          ],
+        }, requestUrl);
+      }
+      throw new Error(`Unexpected AcFun fallback request: ${requestUrl}`);
+    }, async () => {
+      const detailStore = new Map();
+      const searchResponse = await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=AcFun%E5%90%8E%E5%A4%87%E8%A7%86%E9%A2%91'),
+        null,
+        null,
+        detailStore
+      );
+      const searchBody = await parseResponse(searchResponse);
+      assert.equal(searchBody.success, true);
+      assert.equal(searchBody.animes.length, 2);
+      assert.equal(searchBody.animes[0].source, 'acfun');
+
+      const bangumiResponse = await getBangumi(`/api/v2/bangumi/${searchBody.animes[0].animeId}`, detailStore, 'acfun');
+      const bangumiBody = await parseResponse(bangumiResponse);
+      assert.equal(bangumiBody.bangumi.episodes.length, 1);
+      assert.match(bangumiBody.bangumi.episodes[0].url, /\/v\/ac4242001\?oyo_acfun_vid=9900001$/);
+    });
+
+    assert(calls.some((url) => url.includes('/rest/pc-direct/search/bgm')));
+    assert(calls.some((url) => url.includes('/rest/pc-direct/search/video')));
+  });
+
   await t.test('Renren retries a spaced trailing-number title only after an empty exact result', async () => {
     const source = new RenrenSource();
     const originalDeployPlatform = Globals.deployPlatform;
