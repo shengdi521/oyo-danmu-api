@@ -297,6 +297,7 @@ test('worker.js API endpoints', async (t) => {
       SEARCH_EARLY_RETURN_MS: '500',
       SEARCH_EARLY_RETURN_MIN_RESULTS: '1',
       SEARCH_EARLY_RETURN_MIN_SOURCES: '2',
+      SEARCH_EARLY_RETURN_PRIORITY_SOURCES: '2',
     });
     Globals.deployPlatform = 'node';
 

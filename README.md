@@ -457,7 +457,8 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | SEARCH_REQUEST_DEADLINE_MS | 【可选】整次多源搜索总截止时间（毫秒），到期后中止未完成请求并返回已经完成的来源，默认`8000`（8秒），建议值：`5000-15000`       |
 | SEARCH_EARLY_RETURN_MS | 【可选】Node 多源搜索在已获得有效候选时的最早返回时间（毫秒），默认`2000`；不会超过总截止时间       |
 | SEARCH_EARLY_RETURN_MIN_RESULTS | 【可选】自适应提前返回所需的最少有效候选数，默认`1`       |
-| SEARCH_EARLY_RETURN_MIN_SOURCES | 【可选】自适应提前返回前至少已完成的来源数，默认`8`；同时要求多数高优先级源已完成，返回排序仍严格遵循`SOURCE_ORDER`       |
+| SEARCH_EARLY_RETURN_MIN_SOURCES | 【可选】自适应提前返回前至少已完成的来源数，默认`8`，返回排序仍严格遵循`SOURCE_ORDER`       |
+| SEARCH_EARLY_RETURN_PRIORITY_SOURCES | 【可选】自适应提前返回前必须全部完成的最高优先级来源数，默认`4`；按`SOURCE_ORDER`从首项开始计算       |
 | BILIBILI_COOKIE      | 【可选】b站cookie（填入后能抓取完整弹幕和启用港澳台App接口），如 `buvid3=E2BCA ... eao6; theme-avatar-tip-show=SHOWED`，请自行通过浏览器或抓包工具抓取，热心网友测试后，弹幕获取实际最少只需取 `SESSDATA=xxxx` 字段，但如果需要使用港澳台区域稳定的App搜索接口还需要`bili_jct=xxxx`或`access_key=xxxx` 字段，不知道怎么获取cookie的，可以从工具 [cookie-butler](https://cookie-butler.do-u.me) 获取    |
 | DOUBAN_COOKIE      | 【可选】豆瓣cookie，用于豆瓣相关接口请求，配置后可降低豆瓣接口风控影响，提升搜索/详情获取的稳定性。填写浏览器中已登录豆瓣后的完整 Cookie 字符串即可，格式示例：`bid=xxxx; ll="118282"; ...`。如遇到豆瓣搜索不稳定、返回异常或频繁验证，建议优先补充该变量       |
 | YOUKU_CONCURRENCY    | 【可选】youku弹幕请求并发数，用于加快youku弹幕请求速度，不填默认为`8`，最高`16`       |

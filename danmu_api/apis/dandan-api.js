@@ -884,8 +884,10 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
         pipelineTasks.length,
         Math.max(1, Number.parseInt(globals.searchEarlyReturnMinSources, 10) || 8),
       );
-      const priorityWindow = Math.min(pipelineTasks.length, minimumSettled);
-      const minimumPrioritySettled = Math.max(1, Math.ceil(priorityWindow * 0.7));
+      const priorityPrefix = Math.min(
+        pipelineTasks.length,
+        Math.max(1, Number.parseInt(globals.searchEarlyReturnPrioritySources, 10) || 4),
+      );
       const minimumResults = Math.max(1, Number.parseInt(globals.searchEarlyReturnMinResults, 10) || 1);
       const earliestReturnMs = Math.min(
         Math.max(500, Number.parseInt(globals.searchEarlyReturnMs, 10) || 2000),
@@ -900,8 +902,9 @@ async function searchAnimeBody(url, preferAnimeId = null, preferSource = null, d
             if (settledResults[index]) settledIndexes.push(index);
           }
           if (settledIndexes.length < minimumSettled) return false;
-          const prioritySettled = settledIndexes.filter(index => index < priorityWindow).length;
-          if (prioritySettled < minimumPrioritySettled) return false;
+          for (let index = 0; index < priorityPrefix; index++) {
+            if (!settledResults[index]) return false;
+          }
 
           const animeIds = new Set();
           for (const index of settledIndexes) {
