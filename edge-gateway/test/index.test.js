@@ -382,6 +382,9 @@ test("an expired fresh entry serves the long-lived backup and refreshes in the b
   const originalCaches = globalThis.caches;
   const writes = [];
   let originCalls = 0;
+  let releasePromotion;
+  let promotionCompleted = false;
+  const promotionGate = new Promise((resolve) => { releasePromotion = resolve; });
   globalThis.caches = { default: {
     async match(request) {
       if (new URL(request.url).hostname === "stale.cache.invalid") {
@@ -391,6 +394,10 @@ test("an expired fresh entry serves the long-lived backup and refreshes in the b
     },
     async put(request, response) {
       writes.push({ url: request.url, cacheControl: response.headers.get("cache-control") });
+      if (writes.length === 1) {
+        await promotionGate;
+        promotionCompleted = true;
+      }
     },
   } };
   globalThis.fetch = async () => {
@@ -406,15 +413,19 @@ test("an expired fresh entry serves the long-lived backup and refreshes in the b
     );
     assert.equal(response.headers.get("x-edge-cache"), "STALE");
     assert.deepEqual(await response.json(), { source: "backup" });
-    assert(writes.length >= 1, "backup is promoted briefly before returning");
+    assert(writes.length >= 1, "backup promotion starts in the background");
     assert.match(writes[0].cacheControl, /s-maxage=15/);
+    assert.equal(promotionCompleted, false, "stale response does not wait for a slow cache write");
+    assert.equal(originCalls, 0, "refresh waits behind the short promotion without delaying the client");
 
+    releasePromotion();
     await Promise.all(ctx.promises);
     assert.equal(originCalls, 1);
     assert.equal(writes.length, 3, "background refresh updates fresh and backup entries");
     assert(writes.some((entry) => entry.url.startsWith("https://stale.cache.invalid/")));
     assert(writes.some((entry) => /s-maxage=86400/.test(entry.cacheControl)));
   } finally {
+    releasePromotion();
     globalThis.fetch = originalFetch;
     globalThis.caches = originalCaches;
   }

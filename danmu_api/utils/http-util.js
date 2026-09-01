@@ -24,7 +24,10 @@ export function runWithRequestDeadline(timeoutMs, fn) {
   if (globalThis.__FORWARD_WIDGET_RUNTIME__ === true) return fn(null);
   const normalizedTimeout = Math.max(1, Number.parseInt(timeoutMs, 10) || 1);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), normalizedTimeout);
+  const timeoutId = setTimeout(() => controller.abort(new DOMException(
+    `Search deadline exceeded after ${normalizedTimeout}ms`,
+    'AbortError',
+  )), normalizedTimeout);
   const store = { controller, deadlineAt: Date.now() + normalizedTimeout, timeoutMs: normalizedTimeout };
   return requestDeadlineContext.run(store, async () => {
     try {
@@ -35,12 +38,30 @@ export function runWithRequestDeadline(timeoutMs, fn) {
   });
 }
 
-export async function settleUntilRequestDeadline(promises) {
+export async function settleUntilRequestDeadline(promises, options = {}) {
   const pending = Array.from(promises);
   const results = new Array(pending.length);
+  const deadlineStore = requestDeadlineContext.getStore();
+  const earliestReturnMs = Math.max(0, Number.parseInt(options.earliestReturnMs, 10) || 0);
+  const shouldReturnEarly = typeof options.shouldReturnEarly === 'function'
+    ? options.shouldReturnEarly
+    : null;
   let remaining = pending.length;
   let resolveAll;
   const allDone = new Promise((resolve) => { resolveAll = resolve; });
+  let earlyReturnEnabled = earliestReturnMs === 0;
+  let earlyReturnTimer = null;
+
+  const maybeReturnEarly = () => {
+    if (!deadlineStore || !shouldReturnEarly || !earlyReturnEnabled || remaining === 0 || deadlineStore.controller.signal.aborted) {
+      return;
+    }
+    if (!shouldReturnEarly(results)) return;
+    deadlineStore.controller.abort(new DOMException(
+      options.earlyAbortMessage || 'Search sources satisfied early',
+      'AbortError',
+    ));
+  };
 
   if (remaining === 0) return results;
   pending.forEach((promise, index) => {
@@ -50,13 +71,20 @@ export async function settleUntilRequestDeadline(promises) {
     ).finally(() => {
       remaining--;
       if (remaining === 0) resolveAll();
+      else maybeReturnEarly();
     });
   });
 
-  const deadlineStore = requestDeadlineContext.getStore();
   if (!deadlineStore) {
     await allDone;
     return results;
+  }
+
+  if (shouldReturnEarly && earliestReturnMs > 0) {
+    earlyReturnTimer = setTimeout(() => {
+      earlyReturnEnabled = true;
+      maybeReturnEarly();
+    }, earliestReturnMs);
   }
 
   const { controller } = deadlineStore;
@@ -69,9 +97,12 @@ export async function settleUntilRequestDeadline(promises) {
     await Promise.race([allDone, deadlineReached]);
     controller.signal.removeEventListener('abort', onAbort);
   }
+  if (earlyReturnTimer) clearTimeout(earlyReturnTimer);
 
   if (remaining > 0) {
-    const reason = new DOMException(`Search deadline exceeded after ${deadlineStore.timeoutMs}ms`, 'AbortError');
+    const reason = controller.signal.reason instanceof Error
+      ? controller.signal.reason
+      : new DOMException(`Search deadline exceeded after ${deadlineStore.timeoutMs}ms`, 'AbortError');
     for (let index = 0; index < results.length; index++) {
       if (!results[index]) results[index] = { status: 'rejected', reason };
     }
@@ -294,7 +325,18 @@ export async function httpGet(url, options = {}) {
 
         data = decodedData; // 更新解压后的数据
       } else {
-        data = await response.text();
+        // 个别旧站点（如搜狐 videolist）仍返回 GBK；调用方可显式指定编码。
+        if (options.encoding) {
+          const bytes = new Uint8Array(await response.arrayBuffer());
+          let encoding = options.encoding;
+          if (encoding === 'auto') {
+            const contentType = response.headers.get('content-type') || '';
+            encoding = /charset\s*=\s*(gbk|gb2312|big5)/i.exec(contentType)?.[1] || 'utf-8';
+          }
+          data = new TextDecoder(encoding).decode(bytes);
+        } else {
+          data = await response.text();
+        }
       }
 
       let parsedData;

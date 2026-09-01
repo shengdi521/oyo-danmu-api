@@ -703,6 +703,9 @@ export class Envs {
       'VOD_RETURN_MODE': { category: 'source', type: 'select', options: ['all', 'fastest'], description: 'VOD返回模式：all（所有站点）或 fastest（最快的站点），默认fastest' },
       'VOD_REQUEST_TIMEOUT': { category: 'source', type: 'number', description: 'VOD请求超时时间，默认10000', min: 5000, max: 30000 },
       'SEARCH_REQUEST_DEADLINE_MS': { category: 'source', type: 'number', description: '整次多源搜索总截止时间（毫秒），到期后返回已完成来源，默认8000', min: 3000, max: 30000 },
+      'SEARCH_EARLY_RETURN_MS': { category: 'source', type: 'number', description: 'Node 多源搜索获得足够候选后的最早返回时间（毫秒），默认2500', min: 500, max: 15000 },
+      'SEARCH_EARLY_RETURN_MIN_RESULTS': { category: 'source', type: 'number', description: '自适应提前返回所需的最少候选数，默认1', min: 1, max: 100 },
+      'SEARCH_EARLY_RETURN_MIN_SOURCES': { category: 'source', type: 'number', description: '自适应提前返回前至少已完成的来源数，默认10', min: 1, max: 30 },
       'BILIBILI_COOKIE': { category: 'source', type: 'text', description: 'B站Cookie' },
       'BILIBILI_ACCESS_KEY': { category: 'source', type: 'text', description: 'B站APP访问密钥，用于配置代理后的港澳台搜索' },
       'IQIYI_COOKIE': { category: 'source', type: 'text', description: '爱奇艺Cookie，用于登录态搜索和分集请求' },
@@ -782,6 +785,9 @@ export class Envs {
       vodReturnMode: this.get('VOD_RETURN_MODE', 'fastest', 'string').toLowerCase(), // vod返回模式：all（所有站点）或 fastest（最快的站点）
       vodRequestTimeout: this.get('VOD_REQUEST_TIMEOUT', '10000', 'string'), // vod超时时间（默认10秒）
       searchRequestDeadlineMs: this.get('SEARCH_REQUEST_DEADLINE_MS', 8000, 'number'), // 多源搜索总截止时间（默认8秒）
+      searchEarlyReturnMs: this.get('SEARCH_EARLY_RETURN_MS', 2500, 'number'), // Node 搜索获得有效候选后的最早返回时间
+      searchEarlyReturnMinResults: this.get('SEARCH_EARLY_RETURN_MIN_RESULTS', 1, 'number'), // 提前返回所需的最少候选数
+      searchEarlyReturnMinSources: this.get('SEARCH_EARLY_RETURN_MIN_SOURCES', 10, 'number'), // 提前返回前至少已完成的来源数
       bilibliCookie: this.get('BILIBILI_COOKIE', '', 'string', true), // b站cookie
       bilibiliAccessKey: this.get('BILIBILI_ACCESS_KEY', '', 'string', true), // b站APP access key，用于港澳台代理搜索
       iqiyiCookie: this.get('IQIYI_COOKIE', '', 'string', true), // 爱奇艺cookie

@@ -6,6 +6,7 @@ import test from 'node:test';
 import assert from 'node:assert';
 import { handleRequest } from './worker.js';
 import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
+import { stripLinkOffset, applyOffset } from "./utils/offset-util.js";
 import { handleFavoriteRefresh } from './apis/favorite-api.js';
 import { handleClearCache } from './apis/system-api.js';
 import { getRedisCaches, getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry, updateRedisCaches } from "./utils/redis-util.js";
@@ -52,7 +53,7 @@ import { previewJsContent } from './ui/js/preview.js';
 import { convertToAsciiSum } from "./utils/codec-util.js";
 import { convertToDanmakuJson, handleDanmusLike } from "./utils/danmu-util.js";
 import { Segment, SegmentListResponse } from "./models/dandan-model.js"
-import { initBangumiData, searchBangumiData, clearBangumiDataCache } from "./utils/bangumi-data-util.js";
+import { initBangumiData, searchBangumiData, clearBangumiDataCache, dedupeBangumiSearchResults } from "./utils/bangumi-data-util.js";
 import { hideSensitiveInfo } from "./utils/log-util.js";
 import { applyShiftToDanmu, buildNipaplayRequest, generateNipaplaySignature, parseNipaplayRelatedLinks, resolveNipaplayLink } from "./utils/nipaplay-util.js";
 
@@ -221,6 +222,120 @@ test('worker.js API endpoints', async (t) => {
       assert.equal(results[1].reason.name, 'AbortError');
       assert.ok(Date.now() - startedAt < 500);
     });
+  });
+
+  await t.test('adaptive settlement aborts slow tail sources after the quality threshold', async () => {
+    const startedAt = Date.now();
+    const results = await runWithRequestDeadline(1000, () => settleUntilRequestDeadline([
+      Promise.resolve('primary'),
+      Promise.resolve('secondary'),
+      new Promise(() => {}),
+    ], {
+      earliestReturnMs: 25,
+      shouldReturnEarly: settled => settled.filter(Boolean).length >= 2,
+    }));
+
+    assert.deepEqual(results[0], { status: 'fulfilled', value: 'primary' });
+    assert.deepEqual(results[1], { status: 'fulfilled', value: 'secondary' });
+    assert.equal(results[2].status, 'rejected');
+    assert.equal(results[2].reason.name, 'AbortError');
+    assert.match(results[2].reason.message, /satisfied early/i);
+    assert.ok(Date.now() - startedAt < 500);
+  });
+
+  await t.test('Node search coalesces concurrent cold requests for the same title', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'tencent',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '1000',
+    });
+    Globals.deployPlatform = 'node';
+
+    const originalSearch = TencentSource.prototype.search;
+    const originalHandleAnimes = TencentSource.prototype.handleAnimes;
+    let releaseSearch;
+    const gate = new Promise(resolve => { releaseSearch = resolve; });
+    let searchCalls = 0;
+    TencentSource.prototype.search = async () => {
+      searchCalls += 1;
+      await gate;
+      return [{}];
+    };
+    TencentSource.prototype.handleAnimes = async (_raw, _title, results, details) => {
+      const anime = createFavoriteAnime('同键冷搜索', 2, 920001);
+      results.push(anime);
+      details.set(String(anime.animeId), anime);
+    };
+
+    try {
+      const url = new URL('http://localhost/api/v2/search/anime?keyword=%E5%90%8C%E9%94%AE%E5%86%B7%E6%90%9C%E7%B4%A2');
+      const first = searchAnime(new URL(url));
+      const second = searchAnime(new URL(url));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(searchCalls, 1);
+      releaseSearch();
+      const [firstBody, secondBody] = await Promise.all([
+        first.then(parseResponse),
+        second.then(parseResponse),
+      ]);
+      assert.deepEqual(firstBody.animes, secondBody.animes);
+      assert.equal(firstBody.animes.length, 1);
+    } finally {
+      TencentSource.prototype.search = originalSearch;
+      TencentSource.prototype.handleAnimes = originalHandleAnimes;
+      Globals.deployPlatform = '';
+    }
+  });
+
+  await t.test('Node search returns early with stable source priority after enough sources settle', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'tencent,acfun,niconico,renren',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '1500',
+      SEARCH_EARLY_RETURN_MS: '500',
+      SEARCH_EARLY_RETURN_MIN_RESULTS: '1',
+      SEARCH_EARLY_RETURN_MIN_SOURCES: '2',
+    });
+    Globals.deployPlatform = 'node';
+
+    const patches = [
+      [TencentSource, async () => [{}], async (_raw, _title, results, details) => {
+        const anime = createFavoriteAnime('提前收敛', 3, 920002);
+        results.push(anime);
+        details.set(String(anime.animeId), anime);
+      }],
+      [AcfunSource, async () => [], async () => {}],
+      [NiconicoSource, async () => new Promise(() => {}), async () => {}],
+      [RenrenSource, async () => new Promise(() => {}), async () => {}],
+    ].map(([Source, search, handleAnimes]) => ({
+      Source,
+      search: Source.prototype.search,
+      handleAnimes: Source.prototype.handleAnimes,
+      nextSearch: search,
+      nextHandleAnimes: handleAnimes,
+    }));
+    for (const patch of patches) {
+      patch.Source.prototype.search = patch.nextSearch;
+      patch.Source.prototype.handleAnimes = patch.nextHandleAnimes;
+    }
+
+    try {
+      const startedAt = Date.now();
+      const body = await parseResponse(await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=%E6%8F%90%E5%89%8D%E6%94%B6%E6%95%9B'),
+      ));
+      assert.equal(body.animes.length, 1);
+      assert.equal(body.animes[0].source, 'tencent');
+      assert.ok(Date.now() - startedAt < 900);
+    } finally {
+      for (const patch of patches) {
+        patch.Source.prototype.search = patch.search;
+        patch.Source.prototype.handleAnimes = patch.handleAnimes;
+      }
+      Globals.deployPlatform = '';
+    }
   });
 
   await t.test('AcFun source completes search, episodes, and minute-segment comments', async () => {
@@ -1632,6 +1747,54 @@ test('worker.js API endpoints', async (t) => {
     });
   });
 
+  await t.test('stripLinkOffset 解析 @偏移 后缀（@秒数 / @%百分比 / 无偏移 / 合并链接仅取末段）', async () => {
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1'), { cleanUrl: 'https://x.com/v/1', offset: 0, percent: false });
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1@3197'), { cleanUrl: 'https://x.com/v/1', offset: 3197, percent: false });
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1@%50'), { cleanUrl: 'https://x.com/v/1', offset: 50, percent: true });
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1@-50'), { cleanUrl: 'https://x.com/v/1', offset: -50, percent: false });
+    // 合并链接仅从整条 URL 尾部取末段子链接的 @偏移
+    const merged = 'https://x.com/v/A$$$https://x.com/v/B@3197';
+    assert.deepEqual(stripLinkOffset(merged), { cleanUrl: 'https://x.com/v/A$$$https://x.com/v/B', offset: 3197, percent: false });
+    // 容错：非字符串入参不抛错
+    assert.deepEqual(stripLinkOffset(null), { cleanUrl: '', offset: 0, percent: false });
+  });
+
+  await t.test('applyOffset 应用 @偏移 的端点语义（绝对 = 时间+偏移，百分比端点 = 最大时间+偏移）', async () => {
+    const danmus = [{ p: '10,1,16777215,b' }, { p: '20,1,16777215,b' }];
+    // 绝对偏移：每条弹幕时间整体平移 offset 秒
+    assert.deepEqual(applyOffset(danmus, 50).map(d => d.p), ['60.00,1,16777215,b', '70.00,1,16777215,b']);
+    // 百分比偏移：按时间轴缩放，scaleRatio=(maxTime+offset)/maxTime，端点 maxTime → maxTime+offset
+    assert.deepEqual(applyOffset(danmus, 50, { usePercent: true, videoDuration: 20 }).map(d => d.p), ['35.00,1,16777215,b', '70.00,1,16777215,b']);
+    // 合并时长端点一致性：单链接时长 3266、偏移 3197 时，合并时间轴末端为 6463
+    assert.equal(applyOffset([{ t: 3266 }], 3197, { usePercent: false, videoDuration: 3266 })[0].t, 6463);
+  });
+
+  // 测试 Bangumi Data 本地检索结果的同源去重
+  await t.test('dedupeBangumiSearchResults should dedupe same-source results and skip tmdb', () => {
+    const makeResult = (siteKey, siteId, titles) => ({ matchedSiteKey: siteKey, siteId, titles });
+
+    // 同源多条目：保留标题精确命中检索词的一条，其余标题并入别名
+    const merged = dedupeBangumiSearchResults([
+      makeResult('anidb', '19242', ['Re：从零开始的异世界生活 第四季 丧失篇(2026)']),
+      makeResult('anidb', '19242', ['Re：从零开始的异世界生活 第四季 夺还篇(2026)']),
+    ], 'Re：从零开始的异世界生活 第四季 夺还篇(2026)');
+    assert.equal(merged.length, 1, `Expected merged.length === 1, but got ${merged.length}`);
+    assert.equal(merged[0].titles[0], 'Re：从零开始的异世界生活 第四季 夺还篇(2026)');
+    assert.ok(merged[0].titles.includes('Re：从零开始的异世界生活 第四季 丧失篇(2026)'), 'Expected merged titles to include the secondary title');
+
+    // tmdb 不参与去重，同 id 多条均保留
+    const tmdbOnly = dedupeBangumiSearchResults([
+      makeResult('tmdb', '123', ['标题A']),
+      makeResult('tmdb', '123', ['标题B']),
+    ], '检索词');
+    assert.equal(tmdbOnly.length, 2, `Expected tmdbOnly.length === 2, but got ${tmdbOnly.length}`);
+
+    // 不同源 id 空间重叠（同 siteId 不同 matchedSiteKey）不合并
+    const crossSite = dedupeBangumiSearchResults([
+      makeResult('anidb', '19242', ['丧失篇']),
+      makeResult('bangumi', '19242', ['夺还篇']),
+    ], '检索词');
+    assert.equal(crossSite.length, 2, `Expected crossSite.length === 2, but got ${crossSite.length}`);
   });
 
   // await t.test('GET /api/v2/comment/:id?format=json&duration=true should return segment duration and reuse comment cache', async () => {
@@ -3356,6 +3519,8 @@ test('worker.js API endpoints', async (t) => {
 //     }
 //   });
 // });
+
+});
 
 // // 测试 Bangumi Data 数据下载时机（ensureBangumiDataReady）、配置变更触发下载（syncBangumiDataLifecycleOnConfigChange）
 // // 以及 getTMDBChineseTitle 漏写 await 的修复；与 envs RAW_ENV_KEYS 测试同为按需启用的内部测试

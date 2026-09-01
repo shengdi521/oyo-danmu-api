@@ -347,10 +347,11 @@ async function proxy(request, env, ctx, { management = false } = {}) {
     if (backup) {
       const promoted = cacheStorageResponse(backup.clone(), 15);
       const response = decorate(backup, "STALE", ttl);
-      // Promote the backup briefly before returning so concurrent misses do not
-      // stampede the 512 MB origin while one background refresh is running.
-      await caches.default.put(cacheKey, promoted);
       ctx.waitUntil((async () => {
+        // Cache writes can occasionally be much slower than reads. Serve stale
+        // immediately; the Node origin independently collapses any brief race
+        // between PoPs while this short-lived promotion is being written.
+        await caches.default.put(cacheKey, promoted);
         if (!(await checkRateLimit(env, `${ip}:REFRESH`))) return;
         const refreshed = await fetchFromOrigin();
         if (await responseIsCacheable(refreshed, incomingUrl.pathname, request.method)) {
