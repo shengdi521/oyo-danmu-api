@@ -1,0 +1,46 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "oyo-danmu-api-edge",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-19",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    {
+      "pattern": "danmu.oyo131.xyz",
+      "custom_domain": true
+    }
+  ],
+  "vars": {
+    "SERVICE_VERSION": "2026.09.01.3"
+  },
+  "secrets": {
+    "required": ["ADMIN_PATH_TOKEN", "ORIGIN_SHARED_SECRET"]
+  },
+  "vpc_services": [
+    {
+      "binding": "ORIGIN",
+      "service_id": "019ffc3d-5b13-7922-9583-2f4216b7cbe4"
+    }
+  ],
+  "ratelimits": [
+    {
+      "name": "API_RATE_LIMITER",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 60,
+        "period": 60
+      }
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1,
+    "logs": {
+      "enabled": true,
+      "invocation_logs": true,
+      "head_sampling_rate": 0.1
+    }
+  }
+}

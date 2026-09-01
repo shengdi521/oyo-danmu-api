@@ -5,7 +5,8 @@ dotenv.config();
 import test from 'node:test';
 import assert from 'node:assert';
 import { handleRequest } from './worker.js';
-import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
+import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
+import { stripLinkOffset, applyOffset } from "./utils/offset-util.js";
 import { handleFavoriteRefresh } from './apis/favorite-api.js';
 import { handleClearCache } from './apis/system-api.js';
 import { getRedisCaches, getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry, updateRedisCaches } from "./utils/redis-util.js";
@@ -30,7 +31,10 @@ import MaiduiduiSource from "./sources/maiduidui.js";
 import AiyifanSource from "./sources/aiyifan.js";
 import HongguoSource, { parseHongguoPlayerUrl } from "./sources/hongguo.js";
 import AnimekoSource from "./sources/animeko.js";
+import AcfunSource from "./sources/acfun.js";
+import NiconicoSource from "./sources/niconico.js";
 import OtherSource from "./sources/other.js";
+import { httpGet, runWithRequestDeadline, settleUntilRequestDeadline } from "./utils/http-util.js";
 import { NodeHandler } from "./configs/handlers/node-handler.js";
 import { VercelHandler } from "./configs/handlers/vercel-handler.js";
 import { NetlifyHandler } from "./configs/handlers/netlify-handler.js";
@@ -49,7 +53,9 @@ import { previewJsContent } from './ui/js/preview.js';
 import { convertToAsciiSum } from "./utils/codec-util.js";
 import { convertToDanmakuJson, handleDanmusLike } from "./utils/danmu-util.js";
 import { Segment, SegmentListResponse } from "./models/dandan-model.js"
-import { initBangumiData, searchBangumiData, clearBangumiDataCache } from "./utils/bangumi-data-util.js";
+import { initBangumiData, searchBangumiData, clearBangumiDataCache, dedupeBangumiSearchResults } from "./utils/bangumi-data-util.js";
+import { hideSensitiveInfo } from "./utils/log-util.js";
+import { applyShiftToDanmu, buildNipaplayRequest, generateNipaplaySignature, parseNipaplayRelatedLinks, resolveNipaplayLink } from "./utils/nipaplay-util.js";
 
 // Mock Request class for testing
 class MockRequest {
@@ -179,6 +185,8 @@ test('worker.js API endpoints', async (t) => {
   const aiyifanSource = new AiyifanSource();
   const hongguoSource = new HongguoSource();
   const animekoSource = new AnimekoSource();
+  const acfunSource = new AcfunSource();
+  const niconicoSource = new NiconicoSource();
   const otherSource = new OtherSource();
 
   await t.test('GET / should return welcome message', async () => {
@@ -194,6 +202,585 @@ test('worker.js API endpoints', async (t) => {
 
     assert(handler instanceof HuggingfaceHandler);
     assert(HandlerFactory.getSupportedPlatforms().includes('huggingface'));
+  });
+
+  await t.test('request deadline aborts inherited HTTP work and preserves completed results', async () => {
+    await withMockFetch((_url, options) => new Promise((_resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    }), async () => {
+      const startedAt = Date.now();
+      const results = await runWithRequestDeadline(40, () => settleUntilRequestDeadline([
+        Promise.resolve('fast'),
+        httpGet('https://example.com/slow', { timeout: 1000 }),
+      ]));
+      assert.deepEqual(results[0], { status: 'fulfilled', value: 'fast' });
+      assert.equal(results[1].status, 'rejected');
+      assert.equal(results[1].reason.name, 'AbortError');
+      assert.ok(Date.now() - startedAt < 500);
+    });
+  });
+
+  await t.test('adaptive settlement aborts slow tail sources after the quality threshold', async () => {
+    const startedAt = Date.now();
+    const results = await runWithRequestDeadline(1000, () => settleUntilRequestDeadline([
+      Promise.resolve('primary'),
+      Promise.resolve('secondary'),
+      new Promise(() => {}),
+    ], {
+      earliestReturnMs: 25,
+      shouldReturnEarly: settled => settled.filter(Boolean).length >= 2,
+    }));
+
+    assert.deepEqual(results[0], { status: 'fulfilled', value: 'primary' });
+    assert.deepEqual(results[1], { status: 'fulfilled', value: 'secondary' });
+    assert.equal(results[2].status, 'rejected');
+    assert.equal(results[2].reason.name, 'AbortError');
+    assert.match(results[2].reason.message, /satisfied early/i);
+    assert.ok(Date.now() - startedAt < 500);
+  });
+
+  await t.test('Node search coalesces concurrent cold requests for the same title', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'tencent',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '1000',
+    });
+    Globals.deployPlatform = 'node';
+
+    const originalSearch = TencentSource.prototype.search;
+    const originalHandleAnimes = TencentSource.prototype.handleAnimes;
+    let releaseSearch;
+    const gate = new Promise(resolve => { releaseSearch = resolve; });
+    let searchCalls = 0;
+    TencentSource.prototype.search = async () => {
+      searchCalls += 1;
+      await gate;
+      return [{}];
+    };
+    TencentSource.prototype.handleAnimes = async (_raw, _title, results, details) => {
+      const anime = createFavoriteAnime('同键冷搜索', 2, 920001);
+      results.push(anime);
+      details.set(String(anime.animeId), anime);
+    };
+
+    try {
+      const url = new URL('http://localhost/api/v2/search/anime?keyword=%E5%90%8C%E9%94%AE%E5%86%B7%E6%90%9C%E7%B4%A2');
+      const first = searchAnime(new URL(url));
+      const second = searchAnime(new URL(url));
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(searchCalls, 1);
+      releaseSearch();
+      const [firstBody, secondBody] = await Promise.all([
+        first.then(parseResponse),
+        second.then(parseResponse),
+      ]);
+      assert.deepEqual(firstBody.animes, secondBody.animes);
+      assert.equal(firstBody.animes.length, 1);
+    } finally {
+      TencentSource.prototype.search = originalSearch;
+      TencentSource.prototype.handleAnimes = originalHandleAnimes;
+      Globals.deployPlatform = '';
+    }
+  });
+
+  await t.test('Node search returns early with stable source priority after enough sources settle', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'tencent,acfun,niconico,renren',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '1500',
+      SEARCH_EARLY_RETURN_MS: '500',
+      SEARCH_EARLY_RETURN_MIN_RESULTS: '1',
+      SEARCH_EARLY_RETURN_MIN_SOURCES: '2',
+      SEARCH_EARLY_RETURN_PRIORITY_SOURCES: '2',
+    });
+    Globals.deployPlatform = 'node';
+
+    const patches = [
+      [TencentSource, async () => [{}], async (_raw, _title, results, details) => {
+        const anime = createFavoriteAnime('提前收敛', 3, 920002);
+        results.push(anime);
+        details.set(String(anime.animeId), anime);
+      }],
+      [AcfunSource, async () => [], async () => {}],
+      [NiconicoSource, async () => new Promise(() => {}), async () => {}],
+      [RenrenSource, async () => new Promise(() => {}), async () => {}],
+    ].map(([Source, search, handleAnimes]) => ({
+      Source,
+      search: Source.prototype.search,
+      handleAnimes: Source.prototype.handleAnimes,
+      nextSearch: search,
+      nextHandleAnimes: handleAnimes,
+    }));
+    for (const patch of patches) {
+      patch.Source.prototype.search = patch.nextSearch;
+      patch.Source.prototype.handleAnimes = patch.nextHandleAnimes;
+    }
+
+    try {
+      const startedAt = Date.now();
+      const body = await parseResponse(await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=%E6%8F%90%E5%89%8D%E6%94%B6%E6%95%9B'),
+      ));
+      assert.equal(body.animes.length, 1);
+      assert.equal(body.animes[0].source, 'tencent');
+      assert.ok(Date.now() - startedAt < 900);
+    } finally {
+      for (const patch of patches) {
+        patch.Source.prototype.search = patch.search;
+        patch.Source.prototype.handleAnimes = patch.handleAnimes;
+      }
+      Globals.deployPlatform = '';
+    }
+  });
+
+  await t.test('AcFun source completes search, episodes, and minute-segment comments', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'acfun',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '8000',
+    });
+
+    const calls = [];
+    await withMockFetch(async (url, options = {}) => {
+      const requestUrl = String(url);
+      calls.push({ url: requestUrl, method: options.method || 'GET', body: String(options.body || '') });
+
+      if (requestUrl.includes('/rest/pc-direct/search/bgm')) {
+        return mockJsonResponse({
+          result: 0,
+          bgmList: [{
+            id: 6140001,
+            bgmId: 6140001,
+            bgmTitle: 'AcFun测试番剧',
+            year: 2026,
+            coverImageV: 'https://example.com/acfun.jpg',
+            videoList: [
+              { id: 38400001, itemId: 2170001 },
+              { id: 38400002, itemId: 2170002 },
+            ],
+          }],
+        }, requestUrl);
+      }
+
+      if (requestUrl.includes('/bangumi/aa6140001_36188_2170001')) {
+        return {
+          ok: true,
+          status: 200,
+          url: requestUrl,
+          headers: new Headers({ 'content-type': 'text/html' }),
+          text: async () => '<script>{"videoId":38400001,"durationMillis":125000}</script>',
+        };
+      }
+
+      if (requestUrl.endsWith('/rest/pc-direct/new-danmaku/pollByPosition')) {
+        assert.match(String(options.body), /resourceId=38400001/);
+        assert.match(String(options.body), /positionFromInclude=0/);
+        assert.match(String(options.body), /positionToExclude=60000/);
+        return mockJsonResponse({
+          result: 0,
+          addCount: 1,
+          danmakus: [{
+            danmakuId: 90001,
+            body: 'AcFun分片弹幕',
+            position: 12345,
+            mode: 1,
+            color: 16777215,
+            likeCount: 2,
+          }],
+        }, requestUrl);
+      }
+
+      throw new Error(`Unexpected AcFun request: ${requestUrl}`);
+    }, async () => {
+      const detailStore = new Map();
+      const searchResponse = await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=AcFun%E6%B5%8B%E8%AF%95%E7%95%AA%E5%89%A7'),
+        null,
+        null,
+        detailStore
+      );
+      const searchBody = await parseResponse(searchResponse);
+      assert.equal(searchBody.success, true);
+      assert.equal(searchBody.animes.length, 1);
+      assert.equal(searchBody.animes[0].source, 'acfun');
+
+      const bangumiResponse = await getBangumi(`/api/v2/bangumi/${searchBody.animes[0].animeId}`, detailStore, 'acfun');
+      const bangumiBody = await parseResponse(bangumiResponse);
+      assert.equal(bangumiBody.bangumi.episodes.length, 2);
+      assert.match(bangumiBody.bangumi.episodes[0].episodeTitle, /acfun/);
+
+      const commentId = bangumiBody.bangumi.episodes[0].episodeId;
+      const segmentListResponse = await getComment(`/api/v2/comment/${commentId}`, 'json', true, '127.0.0.1');
+      const segmentListBody = await parseResponse(segmentListResponse);
+      assert.equal(segmentListBody.comments.duration, 125);
+      assert.equal(segmentListBody.comments.segmentList.length, 3);
+      assert.equal(new Set(segmentListBody.comments.segmentList.map((segment) => segment.url)).size, 3);
+
+      const segmentResponse = await getSegmentComment(segmentListBody.comments.segmentList[0], 'json');
+      const segmentBody = await parseResponse(segmentResponse);
+      assert.equal(segmentBody.count, 1);
+      assert.equal(segmentBody.comments[0].m, 'AcFun分片弹幕');
+      assert.equal(segmentBody.comments[0].like, 2);
+    });
+
+    assert(calls.some((call) => call.url.includes('/rest/pc-direct/search/bgm')));
+    assert(calls.some((call) => call.url.includes('/bangumi/aa6140001_36188_2170001')));
+    assert(calls.some((call) => call.url.endsWith('/rest/pc-direct/new-danmaku/pollByPosition')));
+    assert(acfunSource instanceof AcfunSource);
+  });
+
+  await t.test('Niconico source completes official search, series episodes, and nvComment timeline', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'niconico',
+      LIKE_SWITCH: 'false',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '8000',
+    });
+
+    const calls = [];
+    await withMockFetch(async (url, options = {}) => {
+      const requestUrl = String(url);
+      calls.push({
+        url: requestUrl,
+        method: options.method || 'GET',
+        body: String(options.body || ''),
+        accept: options.headers?.Accept || options.headers?.accept || '',
+      });
+
+      if (requestUrl.includes('snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search')) {
+        return mockJsonResponse({
+          meta: { status: 200, totalCount: 1 },
+          data: [{
+            contentId: 'sm9001',
+            title: 'Niconico测试动画 第1话',
+            thumbnailUrl: 'https://example.com/niconico.jpg',
+            startTime: '2026-01-01T00:00:00+09:00',
+            lengthSeconds: 1440,
+            commentCounter: 100,
+          }],
+        }, requestUrl);
+      }
+
+      if (requestUrl.includes('www.nicovideo.jp/watch/sm9001') || requestUrl.includes('www.nicovideo.jp/watch/sm9002')) {
+        const videoId = requestUrl.includes('sm9002') ? 'sm9002' : 'sm9001';
+        return mockJsonResponse({
+          meta: { status: 200, code: 'HTTP_200' },
+          data: { response: {
+            video: {
+              id: videoId,
+              title: videoId === 'sm9001' ? 'Niconico测试动画 第1话' : 'Niconico测试动画 第2话',
+              duration: 1440,
+              registeredAt: '2026-01-01T00:00:00+09:00',
+              thumbnail: { url: 'https://example.com/niconico.jpg' },
+            },
+            series: { id: 42, title: 'Niconico测试动画', thumbnailUrl: 'https://example.com/series.jpg' },
+            comment: { nvComment: {
+              threadKey: 'test-thread-key',
+              server: 'https://public.nvcomment.nicovideo.jp',
+              params: { targets: [{ id: '100', fork: 'main' }], language: 'ja-jp' },
+            } },
+          } },
+        }, requestUrl);
+      }
+
+      if (requestUrl.includes('nvapi.nicovideo.jp/v1/series/42')) {
+        return mockJsonResponse({
+          meta: { status: 200 },
+          data: { totalCount: 2, items: [
+            { video: { id: 'sm9001', title: 'Niconico测试动画 第1话', duration: 1440, isPaymentRequired: false } },
+            { video: { id: 'sm9002', title: 'Niconico测试动画 第2话', duration: 1440, isPaymentRequired: false } },
+          ] },
+        }, requestUrl);
+      }
+
+      if (requestUrl.endsWith('public.nvcomment.nicovideo.jp/v1/threads')) {
+        const body = JSON.parse(String(options.body || '{}'));
+        assert.equal(body.threadKey, 'test-thread-key');
+        assert.equal(body.params.targets[0].fork, 'main');
+        return mockJsonResponse({
+          meta: { status: 200 },
+          data: { threads: [{ comments: [{
+            id: 'nico-comment-1',
+            vposMs: 12345,
+            body: 'Niconico时间轴弹幕',
+            commands: ['ue', 'red'],
+            nicoruCount: 7,
+          }] }] },
+        }, requestUrl);
+      }
+
+      throw new Error(`Unexpected Niconico request: ${requestUrl}`);
+    }, async () => {
+      const detailStore = new Map();
+      const searchResponse = await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=Niconico%E6%B5%8B%E8%AF%95%E5%8A%A8%E7%94%BB'),
+        null,
+        null,
+        detailStore
+      );
+      const searchBody = await parseResponse(searchResponse);
+      assert.equal(searchBody.success, true);
+      assert.equal(searchBody.animes.length, 1);
+      assert.equal(searchBody.animes[0].source, 'niconico');
+
+      const bangumiResponse = await getBangumi(`/api/v2/bangumi/${searchBody.animes[0].animeId}`, detailStore, 'niconico');
+      const bangumiBody = await parseResponse(bangumiResponse);
+      assert.equal(bangumiBody.bangumi.episodes.length, 2);
+      assert.match(bangumiBody.bangumi.episodes[0].episodeTitle, /niconico/);
+
+      const commentId = bangumiBody.bangumi.episodes[0].episodeId;
+      const segmentListResponse = await getComment(`/api/v2/comment/${commentId}`, 'json', true, '127.0.0.1');
+      const segmentListBody = await parseResponse(segmentListResponse);
+      assert.equal(segmentListBody.comments.duration, 1440);
+      assert.equal(segmentListBody.comments.segmentList.length, 1);
+      assert.equal(segmentListBody.comments.segmentList[0].url, 'niconico:sm9001');
+
+      const segmentResponse = await getSegmentComment(segmentListBody.comments.segmentList[0], 'json');
+      const segmentBody = await parseResponse(segmentResponse);
+      assert.equal(segmentBody.count, 1);
+      assert.equal(segmentBody.comments[0].m, 'Niconico时间轴弹幕');
+      assert.equal(segmentBody.comments[0].like, 7);
+      assert.match(segmentBody.comments[0].p, /^12\.35,5,16711680,\[niconico\]/);
+    });
+
+    assert(calls.some((call) => call.url.includes('snapshot.search.nicovideo.jp')));
+    assert(calls.some((call) => call.url.includes('nvapi.nicovideo.jp/v1/series/42')));
+    assert(calls.some((call) => call.url.endsWith('public.nvcomment.nicovideo.jp/v1/threads')));
+    assert.equal(calls.filter((call) => call.url.includes('www.nicovideo.jp/watch/sm9001')).length, 1);
+    assert(calls.filter((call) => call.url.includes('www.nicovideo.jp/watch/')).every((call) => call.accept === '*/*'));
+    assert(niconicoSource instanceof NiconicoSource);
+  });
+
+  await t.test('Niconico series episode lookups run in parallel while preserving source order', async () => {
+    resetSearchState();
+    const source = new NiconicoSource();
+    let activeLookups = 0;
+    let maxActiveLookups = 0;
+    let releaseLookups;
+    const bothStarted = new Promise((resolve) => { releaseLookups = resolve; });
+
+    source._getWatchData = async (videoId) => ({
+      video: { id: videoId, title: `视频${videoId}`, duration: 1200, registeredAt: '2026-01-01T00:00:00+09:00' },
+      series: { id: videoId === 'sm1001' ? 100 : 200, title: `系列${videoId}` },
+      comment: { nvComment: { threadKey: `key-${videoId}`, params: { targets: [{ id: videoId }] } } },
+    });
+    source.getEpisodes = async (seriesId) => {
+      activeLookups += 1;
+      maxActiveLookups = Math.max(maxActiveLookups, activeLookups);
+      if (activeLookups === 2) releaseLookups();
+      await bothStarted;
+      activeLookups -= 1;
+      return [{ id: seriesId === '100' ? 'sm1001' : 'sm2001', title: `系列${seriesId} 第1话`, isPaymentRequired: false }];
+    };
+
+    const transformed = await source.handleAnimes([
+      { contentId: 'sm1001', title: '候选1' },
+      { contentId: 'sm2001', title: '候选2' },
+    ], '并行测试', [], new Map());
+
+    assert.equal(maxActiveLookups, 2);
+    assert.deepEqual(transformed.map((anime) => anime.bangumiId), ['100', '200']);
+  });
+
+  await t.test('AcFun search retries once after an aborted first connection', async () => {
+    const source = new AcfunSource();
+    let attempts = 0;
+
+    await withMockFetch(async (url) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new DOMException('AcFun first connection timed out', 'AbortError');
+      }
+
+      return mockJsonResponse({
+        result: 0,
+        bgmList: [{ bgmId: 6140002, bgmTitle: 'AcFun重试测试' }],
+      }, String(url));
+    }, async () => {
+      const results = await source.search('AcFun重试测试');
+      assert.equal(attempts, 2);
+      assert.equal(results.length, 1);
+      assert.equal(results[0].bgmId, 6140002);
+    });
+  });
+
+  await t.test('AcFun falls back to danmaku-bearing videos when the bangumi search is empty', async () => {
+    resetSearchState();
+    Globals.init({
+      SOURCE_ORDER: 'acfun',
+      RATE_LIMIT_MAX_REQUESTS: '0',
+      SEARCH_REQUEST_DEADLINE_MS: '8000',
+    });
+
+    const calls = [];
+    await withMockFetch(async (url) => {
+      const requestUrl = String(url);
+      calls.push(requestUrl);
+
+      if (requestUrl.includes('/rest/pc-direct/search/bgm')) {
+        return mockJsonResponse({ result: 0, totalNum: 0 }, requestUrl);
+      }
+      if (requestUrl.includes('/rest/pc-direct/search/video')) {
+        return mockJsonResponse({
+          result: 0,
+          totalNum: 3,
+          videoList: [
+            {
+              contentId: 4242001,
+              videoId: '9900001',
+              title: 'AcFun后备视频',
+              ctime: Date.UTC(2026, 0, 2),
+              coverUrl: 'https://example.com/acfun-video.jpg',
+              danmuCount: 18,
+            },
+            {
+              contentId: 4242002,
+              videoId: '9900002',
+              title: 'AcFun后备视频较新剪辑',
+              ctime: Date.UTC(2027, 0, 1),
+              coverUrl: 'https://example.com/acfun-newer.jpg',
+              danmuCount: 10,
+            },
+            {
+              contentId: 4242003,
+              videoId: '9900003',
+              title: 'AcFun后备视频无弹幕版',
+              ctime: Date.UTC(2028, 0, 1),
+              coverUrl: 'https://example.com/acfun-empty.jpg',
+              danmuCount: 0,
+            },
+          ],
+        }, requestUrl);
+      }
+      throw new Error(`Unexpected AcFun fallback request: ${requestUrl}`);
+    }, async () => {
+      const detailStore = new Map();
+      const searchResponse = await searchAnime(
+        new URL('http://localhost/api/v2/search/anime?keyword=AcFun%E5%90%8E%E5%A4%87%E8%A7%86%E9%A2%91'),
+        null,
+        null,
+        detailStore
+      );
+      const searchBody = await parseResponse(searchResponse);
+      assert.equal(searchBody.success, true);
+      assert.equal(searchBody.animes.length, 2);
+      assert.equal(searchBody.animes[0].source, 'acfun');
+
+      const bangumiResponse = await getBangumi(`/api/v2/bangumi/${searchBody.animes[0].animeId}`, detailStore, 'acfun');
+      const bangumiBody = await parseResponse(bangumiResponse);
+      assert.equal(bangumiBody.bangumi.episodes.length, 1);
+      assert.match(bangumiBody.bangumi.episodes[0].url, /\/v\/ac4242001\?oyo_acfun_vid=9900001$/);
+    });
+
+    assert(calls.some((url) => url.includes('/rest/pc-direct/search/bgm')));
+    assert(calls.some((url) => url.includes('/rest/pc-direct/search/video')));
+  });
+
+  await t.test('Renren retries a spaced trailing-number title only after an empty exact result', async () => {
+    const source = new RenrenSource();
+    const originalDeployPlatform = Globals.deployPlatform;
+    const calls = [];
+    Globals.deployPlatform = 'node';
+    source._searchLocal = async (keyword) => {
+      calls.push(keyword);
+      return keyword === '惊声尖叫 6' ? [{ title: '惊声尖叫6' }] : [];
+    };
+
+    try {
+      const fallbackResults = await source.search('惊声尖叫6');
+      assert.deepEqual(calls, ['惊声尖叫6', '惊声尖叫 6']);
+      assert.equal(fallbackResults.length, 1);
+
+      calls.length = 0;
+      source._searchLocal = async (keyword) => {
+        calls.push(keyword);
+        return [{ title: keyword }];
+      };
+      await source.search('斗罗大陆2');
+      assert.deepEqual(calls, ['斗罗大陆2']);
+
+      calls.length = 0;
+      source._searchLocal = async (keyword) => {
+        calls.push(keyword);
+        return [];
+      };
+      await source.search('Scream6');
+      assert.deepEqual(calls, ['Scream6']);
+
+      const limitedSource = new RenrenSource();
+      const limitedTierCalls = [];
+      limitedSource.performWinSearch = async () => { limitedTierCalls.push('WIN'); return null; };
+      limitedSource.searchAppContent = async () => { limitedTierCalls.push('TV'); return null; };
+      limitedSource.performMacSearch = async () => { limitedTierCalls.push('MAC'); return null; };
+      limitedSource.performNetworkSearch = async () => { limitedTierCalls.push('WEB'); return null; };
+      await limitedSource._searchLocal('单接口快速失败', {
+        maxTierAttempts: 1,
+        advanceOnFailure: true,
+      });
+      await limitedSource._searchLocal('从下一接口继续', { maxTierAttempts: 1 });
+      assert.deepEqual(limitedTierCalls, ['WIN', 'TV']);
+
+      const detailSource = new RenrenSource();
+      detailSource.performWinSearch = async () => null;
+      detailSource.searchAppContent = async () => [{ id: 'movie-1' }];
+      await detailSource._searchLocal('TV详情竞速准备');
+      const detailCalls = [];
+      detailSource.getWebDramaDetailFallback = async () => {
+        detailCalls.push('WEB');
+        return new Promise(() => {});
+      };
+      const tvDetail = { episodeList: [{ sid: 'episode-1' }] };
+      detailSource.getAppDramaDetail = async () => {
+        detailCalls.push('TV');
+        return tvDetail;
+      };
+      const racedDetail = await detailSource._getDetailLocal('movie-1');
+      assert.deepEqual(detailCalls, ['WEB', 'TV']);
+      assert.equal(racedDetail, tvDetail);
+
+    } finally {
+      Globals.deployPlatform = originalDeployPlatform;
+    }
+  });
+
+  await t.test('FongMi comments use the public host, collapse the short path, and cap candidates', async () => {
+    resetFavoriteState();
+    const anime = createFavoriteAnime('FongMi反代测试', 80, 940001);
+    const originalSearch = TencentSource.prototype.search;
+    const originalHandleAnimes = TencentSource.prototype.handleAnimes;
+    const originalOrder = Globals.envs.sourceOrderArr;
+    TencentSource.prototype.search = async () => [{}];
+    TencentSource.prototype.handleAnimes = async (_source, _title, results, details) => {
+      results.push(anime);
+      details.set(String(anime.animeId), anime);
+    };
+    try {
+      const request = new Request('http://danmu.internal/danmaku/api/v2/fongmi/danmaku?name=FongMi%E5%8F%8D%E4%BB%A3%E6%B5%8B%E8%AF%95&episode=1', {
+        headers: {
+          'x-forwarded-host': 'danmu.oyo131.xyz',
+          'x-forwarded-proto': 'https'
+        }
+      });
+      const body = await parseResponse(await handleRequest(request, {
+        SOURCE_ORDER: 'tencent',
+        USE_BANGUMI_DATA: 'false'
+      }, 'cloudflare', '127.0.0.1', {}));
+      assert.equal(body.length, 50);
+      assert.equal(body[0].url, 'https://danmu.oyo131.xyz/api/v2/comment/9400011?format=xml');
+      assert.ok(body.every(item => item.url.startsWith('https://danmu.oyo131.xyz/api/v2/comment/')));
+    } finally {
+      TencentSource.prototype.search = originalSearch;
+      TencentSource.prototype.handleAnimes = originalHandleAnimes;
+      Globals.envs.sourceOrderArr = originalOrder;
+    }
   });
 
   await t.test('HuggingfaceHandler should call Space variables and restart APIs', async () => {
@@ -253,6 +840,43 @@ test('worker.js API endpoints', async (t) => {
     });
 
     assert.equal(seenRedirectMode, 'manual');
+  });
+
+  await t.test('runtime media credentials stay separate and iQIYI auth is scoped to iQIYI hosts', async () => {
+    const accessKey = 'a'.repeat(32);
+    const csrfToken = 'b'.repeat(32);
+    Globals.init({
+      BILIBILI_COOKIE: `bili_jct=${csrfToken}; DedeUserID=123`,
+      BILIBILI_ACCESS_KEY: accessKey,
+      IQIYI_COOKIE: 'P00001=auth-token; P00003=456; vipTypes=58; vipLevel=6',
+    });
+
+    const bilibili = new BilibiliSource();
+    const iqiyi = new IqiyiSource();
+    assert.equal(bilibili._resolveAccessKey(), accessKey);
+    assert.deepEqual(iqiyi._getAccountContext(), {
+      authCookie: 'auth-token',
+      userId: '456',
+      vipType: '58',
+      vipStatus: '1',
+      userVip: '1',
+    });
+    assert.match(iqiyi._authenticatedHeaders('https://mesh.if.iqiyi.com/test').Cookie, /P00001=auth-token/);
+    assert.equal(iqiyi._authenticatedHeaders('https://pcw-api.iq.com/test').Cookie, undefined);
+
+    Globals.init({ BILIBILI_COOKIE: `bili_jct=${csrfToken}; DedeUserID=123` });
+    assert.equal(new BilibiliSource()._resolveAccessKey(), '');
+  });
+
+  await t.test('media credentials are redacted when embedded in URLs or cookie fragments', () => {
+    const output = hideSensitiveInfo(
+      'https://example.test/path?auth_cookie=iqiyi-secret&access_key=bili-secret token=x; P00001=passport-secret; bili_jct=csrf-secret; safe=1'
+    );
+    assert.equal(output.includes('iqiyi-secret'), false);
+    assert.equal(output.includes('bili-secret'), false);
+    assert.equal(output.includes('passport-secret'), false);
+    assert.equal(output.includes('csrf-secret'), false);
+    assert.equal(output.includes('safe=1'), true);
   });
 
   await t.test('buildSearchAnimeUrl should preserve special characters in keyword', async () => {
@@ -1003,6 +1627,175 @@ test('worker.js API endpoints', async (t) => {
       assert.doesNotThrow(() => new Function(previewJsContent));
       assert.match(previewJsContent, /AUTO_MATCH_MAPPING_TABLE/);
     });
+
+  await t.test('handleClearCache clears only the selected cache items', async t => {
+    // 各清理项对应的全局状态种子；favorites 不在清理范围内，用于验证不被误清
+    const seed = () => {
+      Globals.animes = [{ id: 1 }];
+      Globals.episodeIds = ['ep1'];
+      Globals.episodeNum = 50000;
+      Globals.lastSelectMap = new Map([['k', {}]]);
+      Globals.searchCache = new Map([['k', {}]]);
+      Globals.commentCache = new Map([['k', {}]]);
+      Globals.requestHistory = new Map([['ip', []]]);
+      Globals.reqRecords = [{ a: 1 }];
+      Globals.todayReqNum = 42;
+      Globals.favoriteCache = new Map([['fav', {}]]);
+      Globals.useBangumiData = false;
+    };
+
+    await t.test('single item clears only that item', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: ['animes'] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(body.clearedItems.animes, 0);
+      assert.equal(Globals.animes.length, 0);
+      assert.equal(Globals.episodeIds.length, 1);
+      assert.equal(Globals.lastSelectMap.size, 1);
+      assert.equal(Globals.searchCache.size, 1);
+      assert.equal(Globals.commentCache.size, 1);
+      assert.equal(Globals.requestHistory.size, 1);
+    });
+
+    await t.test('invalid keys are filtered out and do not throw', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: ['animes', 'notARealKey', 'animesX'] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(Globals.animes.length, 0);
+      assert.equal(Globals.searchCache.size, 1);
+      assert.equal(Globals.commentCache.size, 1);
+    });
+
+    await t.test('requestHistory folds reqRecords and todayReqNum', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: ['requestHistory'] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(body.clearedItems.requestHistory, 0);
+      assert.equal(body.clearedItems.reqRecords, 0);
+      assert.equal(body.clearedItems.todayReqNum, 0);
+      assert.equal(Globals.requestHistory.size, 0);
+      assert.deepEqual(Globals.reqRecords, []);
+      assert.equal(Globals.todayReqNum, 0);
+      assert.equal(Globals.animes.length, 1);
+    });
+
+    await t.test('episodeNum resets to the initial value 10001', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: ['episodeNum'] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(body.clearedItems.episodeNum, 10001);
+      assert.equal(Globals.episodeNum, 10001);
+      assert.equal(Globals.animes.length, 1);
+    });
+
+    await t.test('favorites are preserved across full clear', async () => {
+      seed();
+      const res = await handleClearCache();
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(Globals.favoriteCache.size, 1);
+      assert.equal(Globals.animes.length, 0);
+      assert.equal(Globals.episodeIds.length, 0);
+      assert.equal(Globals.lastSelectMap.size, 0);
+      assert.equal(Globals.searchCache.size, 0);
+      assert.equal(Globals.commentCache.size, 0);
+      assert.equal(Globals.requestHistory.size, 0);
+      assert.equal(Globals.todayReqNum, 0);
+      assert.deepEqual(Globals.reqRecords, []);
+    });
+
+    await t.test('empty items array clears nothing', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: [] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(Globals.animes.length, 1);
+      assert.equal(Globals.searchCache.size, 1);
+      assert.equal(Globals.commentCache.size, 1);
+    });
+
+    await t.test('malformed body (non-array items) triggers full clear', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: 'animes' }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(Globals.animes.length, 0);
+      assert.equal(Globals.searchCache.size, 0);
+    });
+
+    await t.test('bangumiData is a recognized key and isolated from other caches', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: ['bangumiData'] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(body.clearedItems.bangumiData, 0);
+      assert.equal(Globals.animes.length, 1);
+      assert.equal(Globals.searchCache.size, 1);
+    });
+
+    await t.test('prototype keys like __proto__ are rejected and do not break the clear', async () => {
+      seed();
+      const res = await handleClearCache({ json: async () => ({ items: ['animes', '__proto__', 'constructor', 'animes'] }) });
+      const body = await parseResponse(res);
+      assert.equal(body.success, true);
+      assert.equal(Globals.animes.length, 0);
+      assert.equal(Globals.searchCache.size, 1);
+      assert.equal(Globals.commentCache.size, 1);
+    });
+  });
+
+  await t.test('stripLinkOffset 解析 @偏移 后缀（@秒数 / @%百分比 / 无偏移 / 合并链接仅取末段）', async () => {
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1'), { cleanUrl: 'https://x.com/v/1', offset: 0, percent: false });
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1@3197'), { cleanUrl: 'https://x.com/v/1', offset: 3197, percent: false });
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1@%50'), { cleanUrl: 'https://x.com/v/1', offset: 50, percent: true });
+    assert.deepEqual(stripLinkOffset('https://x.com/v/1@-50'), { cleanUrl: 'https://x.com/v/1', offset: -50, percent: false });
+    // 合并链接仅从整条 URL 尾部取末段子链接的 @偏移
+    const merged = 'https://x.com/v/A$$$https://x.com/v/B@3197';
+    assert.deepEqual(stripLinkOffset(merged), { cleanUrl: 'https://x.com/v/A$$$https://x.com/v/B', offset: 3197, percent: false });
+    // 容错：非字符串入参不抛错
+    assert.deepEqual(stripLinkOffset(null), { cleanUrl: '', offset: 0, percent: false });
+  });
+
+  await t.test('applyOffset 应用 @偏移 的端点语义（绝对 = 时间+偏移，百分比端点 = 最大时间+偏移）', async () => {
+    const danmus = [{ p: '10,1,16777215,b' }, { p: '20,1,16777215,b' }];
+    // 绝对偏移：每条弹幕时间整体平移 offset 秒
+    assert.deepEqual(applyOffset(danmus, 50).map(d => d.p), ['60.00,1,16777215,b', '70.00,1,16777215,b']);
+    // 百分比偏移：按时间轴缩放，scaleRatio=(maxTime+offset)/maxTime，端点 maxTime → maxTime+offset
+    assert.deepEqual(applyOffset(danmus, 50, { usePercent: true, videoDuration: 20 }).map(d => d.p), ['35.00,1,16777215,b', '70.00,1,16777215,b']);
+    // 合并时长端点一致性：单链接时长 3266、偏移 3197 时，合并时间轴末端为 6463
+    assert.equal(applyOffset([{ t: 3266 }], 3197, { usePercent: false, videoDuration: 3266 })[0].t, 6463);
+  });
+
+  // 测试 Bangumi Data 本地检索结果的同源去重
+  await t.test('dedupeBangumiSearchResults should dedupe same-source results and skip tmdb', () => {
+    const makeResult = (siteKey, siteId, titles) => ({ matchedSiteKey: siteKey, siteId, titles });
+
+    // 同源多条目：保留标题精确命中检索词的一条，其余标题并入别名
+    const merged = dedupeBangumiSearchResults([
+      makeResult('anidb', '19242', ['Re：从零开始的异世界生活 第四季 丧失篇(2026)']),
+      makeResult('anidb', '19242', ['Re：从零开始的异世界生活 第四季 夺还篇(2026)']),
+    ], 'Re：从零开始的异世界生活 第四季 夺还篇(2026)');
+    assert.equal(merged.length, 1, `Expected merged.length === 1, but got ${merged.length}`);
+    assert.equal(merged[0].titles[0], 'Re：从零开始的异世界生活 第四季 夺还篇(2026)');
+    assert.ok(merged[0].titles.includes('Re：从零开始的异世界生活 第四季 丧失篇(2026)'), 'Expected merged titles to include the secondary title');
+
+    // tmdb 不参与去重，同 id 多条均保留
+    const tmdbOnly = dedupeBangumiSearchResults([
+      makeResult('tmdb', '123', ['标题A']),
+      makeResult('tmdb', '123', ['标题B']),
+    ], '检索词');
+    assert.equal(tmdbOnly.length, 2, `Expected tmdbOnly.length === 2, but got ${tmdbOnly.length}`);
+
+    // 不同源 id 空间重叠（同 siteId 不同 matchedSiteKey）不合并
+    const crossSite = dedupeBangumiSearchResults([
+      makeResult('anidb', '19242', ['丧失篇']),
+      makeResult('bangumi', '19242', ['夺还篇']),
+    ], '检索词');
+    assert.equal(crossSite.length, 2, `Expected crossSite.length === 2, but got ${crossSite.length}`);
   });
 
   // await t.test('GET /api/v2/comment/:id?format=json&duration=true should return segment duration and reuse comment cache', async () => {
@@ -2727,3 +3520,234 @@ test('worker.js API endpoints', async (t) => {
 //     }
 //   });
 // });
+
+});
+
+// // 测试 Bangumi Data 数据下载时机（ensureBangumiDataReady）、配置变更触发下载（syncBangumiDataLifecycleOnConfigChange）
+// // 以及 getTMDBChineseTitle 漏写 await 的修复；与 envs RAW_ENV_KEYS 测试同为按需启用的内部测试
+// import { globals } from './configs/globals.js';
+// import { ensureBangumiDataReady, syncBangumiDataLifecycleOnConfigChange, initBangumiData, clearBangumiDataCache } from './utils/bangumi-data-util.js';
+// import fs from 'node:fs';
+// import path from 'node:path';
+//
+// test('bangumi-data 数据下载时机与配置变更触发下载', async (t) => {
+//   const CACHE_DIR = path.join(process.cwd(), '.cache');
+//   const CACHE_FILE = path.join(CACHE_DIR, 'bangumi-data-cache.json');
+//   const FAKE_ITEM = {
+//     title: 'FrobeniusTestAnime',
+//     titleTranslate: { 'zh-Hans': ['弗罗贝尼乌斯测试动画', 'FrobeniusTestAnime'] },
+//     sites: [{ site: 'tmdb', id: '999999' }],
+//     _flatText: 'frobeniustestanime'
+//   };
+//   const reset = () => {
+//     globals.useBangumiData = false;
+//     clearBangumiDataCache(false);
+//     if (fs.existsSync(CACHE_FILE)) fs.writeFileSync(CACHE_FILE, '', 'utf-8');
+//   };
+//
+//   await t.test('ensureBangumiDataReady 开关关闭时直接返回且不触发下载', async () => {
+//     reset();
+//     globals.useBangumiData = false;
+//     await ensureBangumiDataReady('node');
+//     assert.ok(true);
+//   });
+//
+//   await t.test('syncBangumiDataLifecycleOnConfigChange 开关关闭释放缓存、开启安全触发', async () => {
+//     reset();
+//     globals.useBangumiData = false;
+//     assert.doesNotThrow(() => syncBangumiDataLifecycleOnConfigChange('node'));
+//     fs.mkdirSync(CACHE_DIR, { recursive: true });
+//     fs.writeFileSync(CACHE_FILE, JSON.stringify({ items: [FAKE_ITEM] }), 'utf-8');
+//     globals.useBangumiData = true;
+//     assert.doesNotThrow(() => syncBangumiDataLifecycleOnConfigChange('node'));
+//   });
+//
+//   await t.test('getTMDBChineseTitle 经 await 命中本地中文名（修复漏写 await）', async () => {
+//     reset();
+//     globals.useBangumiData = true;
+//     const originalContent = fs.existsSync(CACHE_FILE) ? fs.readFileSync(CACHE_FILE, 'utf-8') : null;
+//     fs.mkdirSync(CACHE_DIR, { recursive: true });
+//     fs.writeFileSync(CACHE_FILE, JSON.stringify({ items: [FAKE_ITEM] }), 'utf-8');
+//     try {
+//       await initBangumiData('node', true);
+//       const result = await getTMDBChineseTitle('FrobeniusTestAnime');
+//       assert.equal(result, '弗罗贝尼乌斯测试动画');
+//     } finally {
+//       clearBangumiDataCache(false);
+//       if (originalContent !== null) fs.writeFileSync(CACHE_FILE, originalContent, 'utf-8');
+//       else fs.writeFileSync(CACHE_FILE, '', 'utf-8');
+//     }
+//   });
+// });
+
+// // 测试 Bangumi Data 在途下载暴露与边缘生命周期延长（getBackgroundDownload / extendBangumiDownloadLifecycle）
+// // 与上方 bangumi 测试同为按需启用的内部测试；沙箱有网时真实下载以验证在途暴露、注册与清理
+// import { globals } from './configs/globals.js';
+// import { initBangumiData, getBackgroundDownload, extendBangumiDownloadLifecycle } from './utils/bangumi-data-util.js';
+// import assert from 'node:assert';
+// import fs from 'node:fs';
+// import path from 'node:path';
+//
+// test('bangumi-data 在途下载暴露与边缘生命周期延长', async (t) => {
+//   const CACHE_DIR = path.join(process.cwd(), '.cache');
+//   const CACHE_FILE = path.join(CACHE_DIR, 'bangumi-data-cache.json');
+//   const hadCache = fs.existsSync(CACHE_DIR);
+//
+//   // 空闲时无在途下载
+//   assert.strictEqual(getBackgroundDownload(), null);
+//
+//   await t.test('extendBangumiDownloadLifecycle 在无在途或 ctx 缺失时不注册', async () => {
+//     const calls = [];
+//     extendBangumiDownloadLifecycle(null);
+//     extendBangumiDownloadLifecycle({ waitUntil: (p) => calls.push(p) });
+//     assert.strictEqual(calls.length, 0);
+//   });
+//
+//   await t.test('在途下载被暴露、响应后由边缘 waitUntil 注册、完成后清理', async () => {
+//     globals.useBangumiData = true;
+//     // 启动真实下载（无 .cache 时走内存路径，不落地文件；有 .cache 则后台刷新），不在途时立即返回
+//     const initPromise = initBangumiData('node', true);
+//     const bg = getBackgroundDownload();
+//     assert.ok(bg && typeof bg.then === 'function', '下载在途时应暴露 Promise');
+//     const ctx = { waitUntil: (p) => { ctx.registered = p; } };
+//     extendBangumiDownloadLifecycle(ctx);
+//     assert.strictEqual(ctx.registered, bg, '边缘 waitUntil 应注册在途 Promise');
+//     await bg; // 等待下载完成（兼容阻塞与后台两种路径）
+//     assert.strictEqual(getBackgroundDownload(), null, '下载完成后应清理在途状态');
+//     globals.useBangumiData = false;
+//     if (!hadCache && fs.existsSync(CACHE_FILE)) fs.writeFileSync(CACHE_FILE, '', 'utf-8');
+//     await initPromise.catch(() => {});
+//   });
+// // 测试自定义文本类变量绕过 dotenv 注释截断（保留 # 等字符），对应 envs.js RAW_ENV_KEYS 修复
+// import { Envs } from './configs/envs.js';
+//
+// test('envs RAW_ENV_KEYS 保留 # 不被 dotenv 截断', async (t) => {
+//   const reset = () => { Envs.systemEnvBackup = null; Envs.rawEnvValues = null; Envs.env = undefined; };
+//
+//   await t.test('parseRawEnvText 保留行内 # 与剥除外层双引号', () => {
+//     const parsed = Envs.parseRawEnvText('K1=v1\nK2=v with # hash\nK3="q # v"');
+//     assert.strictEqual(parsed.K2, 'v with # hash');
+//     assert.strictEqual(parsed.K3, 'q # v');
+//   });
+//
+//   await t.test('CUSTOM_MERGE_RULES / COLOR_POOL / URL 类变量含 # 完整保留', () => {
+//     reset();
+//     Envs.systemEnvBackup = {};
+//     Envs.rawEnvValues = {
+//       CUSTOM_MERGE_RULES: 'A #1 revival@bili',
+//       COLOR_POOL: '#FF0000,#00FF00',
+//       DANMU_PUSH_URL: 'http://h.com/cb#frag',
+//     };
+//     assert.strictEqual(Envs.get('CUSTOM_MERGE_RULES', '', 'string'), 'A #1 revival@bili');
+//     assert.strictEqual(Envs.get('COLOR_POOL', '', 'string'), '#FF0000,#00FF00');
+//     assert.strictEqual(Envs.get('DANMU_PUSH_URL', '', 'string'), 'http://h.com/cb#frag');
+//   });
+//
+//   await t.test('!encrypt 守卫：加密变量不走原始解析，防止绕过加密', () => {
+//     reset();
+//     Envs.systemEnvBackup = {};
+//     Envs.rawEnvValues = { DANMU_PUSH_URL: 'http://x.com/cb#frag' };
+//     assert.strictEqual(Envs.get('DANMU_PUSH_URL', 'DEF', 'string', true), 'DEF');
+//   });
+
+// test('nipaplay 弹弹302关联工具函数', async (t) => {
+//
+//   // generateNipaplaySignature：相同入参确定性产出，输出为 sha256 的 base64（44 字符）
+//   const sig1 = generateNipaplaySignature('app', '1700000000', '/api/v2/comment/1', 'secret');
+//   const sig2 = generateNipaplaySignature('app', '1700000000', '/api/v2/comment/1', 'secret');
+//   assert.strictEqual(sig1, sig2, '相同入参签名一致');
+//   assert.strictEqual(sig1.length, 44, 'sha256 base64 长度为 44');
+//   const sig3 = generateNipaplaySignature('app', '1700000001', '/api/v2/comment/1', 'secret');
+//   assert.notStrictEqual(sig1, sig3, 'timestamp 不同签名不同');
+//
+//   // parseNipaplayRelatedLinks：解析 urls（|）与 shift（,），按主机名映射到内部源并还原时间偏移
+//   const location = 'https://x.test/redirect?urls=https://www.bilibili.com/video/BV1xx|https://ani.gamer.com.tw/animeVideo.php?sn=12345&shift=0,30';
+//   const parsed = parseNipaplayRelatedLinks(location);
+//   assert.strictEqual(parsed.bilibili.length, 1, 'bilibili 链接被解析');
+//   assert.strictEqual(parsed.bilibili[0].url, 'https://www.bilibili.com/video/BV1xx', 'bilibili 仅保留 BV 主体');
+//   assert.strictEqual(parsed.bilibili[0].shift, 0, 'bilibili shift 为 0');
+//   assert.strictEqual(parsed.bahamut.length, 1, 'bahamut 链接被解析');
+//   assert.strictEqual(parsed.bahamut[0].url, 'https://ani.gamer.com.tw/animeVideo.php?sn=12345', 'bahamut 保留原始 URL');
+//   assert.strictEqual(parsed.bahamut[0].shift, 30, 'bahamut shift 为 30');
+//   assert.strictEqual(parsed.iqiyi.length, 0, '未提供平台为空');
+//   for (const k of ['bilibili', 'bahamut', 'iqiyi', 'youku', 'tencent', 'imgo']) {
+//     assert.deepStrictEqual(parseNipaplayRelatedLinks('')[k], [], `空字符串入参 ${k} 为空数组`);
+//     assert.deepStrictEqual(parseNipaplayRelatedLinks(null)[k], [], `空入参 ${k} 为空数组`);
+//   }
+//
+//   // resolveNipaplayLink：主机名到源路由，bahamut 提取 sn
+//   assert.deepStrictEqual(resolveNipaplayLink('https://ani.gamer.com.tw/animeVideo.php?sn=999'), { source: 'bahamut', realId: '999' });
+//   assert.deepStrictEqual(resolveNipaplayLink('https://v.qq.com/x/cover/abc.html'), { source: 'tencent', realId: 'https://v.qq.com/x/cover/abc.html' });
+//   assert.deepStrictEqual(resolveNipaplayLink('https://www.bilibili.com/video/BVxyz'), { source: 'bilibili', realId: 'https://www.bilibili.com/video/BVxyz' });
+//   assert.deepStrictEqual(resolveNipaplayLink('https://bilibili.com/video/BVxyz'), { source: 'bilibili', realId: 'https://bilibili.com/video/BVxyz' }, '无 www 前缀的裸域名同样归入 bilibili');
+//   assert.deepStrictEqual(resolveNipaplayLink('https://b23.tv/BVxyz'), { source: 'bilibili', realId: 'https://b23.tv/BVxyz' }, 'b站短链 b23.tv 经统一映射归入 bilibili');
+//   assert.deepStrictEqual(resolveNipaplayLink('https://unknown.example/x'), { source: null, realId: 'https://unknown.example/x' });
+//
+//   // parse 与 resolve 对 b23.tv 的识别保持一致：均归入 bilibili
+//   const b23Location = 'https://x.test/redirect?urls=https://b23.tv/BV1xx&shift=0';
+//   const b23Parsed = parseNipaplayRelatedLinks(b23Location);
+//   assert.strictEqual(b23Parsed.bilibili.length, 1, 'b23.tv 链接经 parse 归入 bilibili');
+//   assert.deepStrictEqual(resolveNipaplayLink(b23Parsed.bilibili[0].url), { source: 'bilibili', realId: b23Parsed.bilibili[0].url }, 'parse 与 resolve 对 b23.tv 的源识别一致');
+//
+//   // applyShiftToDanmu：校正时间偏移并标记实时拉取，不污染原对象
+//   const src = { p: '12.34,1,25,16777215,0', t: 12.34 };
+//   const shifted = applyShiftToDanmu(src, 5);
+//   assert.strictEqual(shifted.p, '17.34,1,25,16777215,0', 'p 时间字段加偏移');
+//   assert.strictEqual(shifted.t, 17.34, 't 加偏移');
+//   assert.strictEqual(shifted.isRealTimePulled, true, '标记为实时拉取');
+//   assert.strictEqual(src.p, '12.34,1,25,16777215,0', '原对象未被修改');
+//   assert.strictEqual(applyShiftToDanmu(null, 5), null, '空对象直接返回');
+// });
+
+test('nipaplay 302 关联工具使用运行时凭证且保持纯函数可测', async (t) => {
+  await t.test('签名稳定并随时间戳变化', () => {
+    const sig1 = generateNipaplaySignature('test-app', '1700000000', '/api/v2/comment/1', 'test-secret');
+    const sig2 = generateNipaplaySignature('test-app', '1700000000', '/api/v2/comment/1', 'test-secret');
+    const sig3 = generateNipaplaySignature('test-app', '1700000001', '/api/v2/comment/1', 'test-secret');
+    assert.strictEqual(sig1, sig2);
+    assert.strictEqual(sig1.length, 44);
+    assert.notStrictEqual(sig1, sig3);
+  });
+
+  await t.test('缺失凭证或非法 episodeId 时不构造请求', () => {
+    assert.strictEqual(buildNipaplayRequest('1', { appId: '', appSecret: '' }), null);
+    assert.strictEqual(buildNipaplayRequest('../admin', { appId: 'test-app', appSecret: 'test-secret' }), null);
+  });
+
+  await t.test('运行时凭证只进入签名请求头', () => {
+    const request = buildNipaplayRequest('12345', {
+      appId: 'test-app',
+      appSecret: 'test-secret',
+      timestamp: 1700000000,
+    });
+    assert.strictEqual(request.url, 'https://api.dandanplay.net/api/v2/comment/12345?withRelated=true&chConvert=0');
+    assert.strictEqual(request.options.headers['X-AppId'], 'test-app');
+    assert.strictEqual(request.options.headers['X-Timestamp'], '1700000000');
+    assert.strictEqual(request.options.headers['X-Signature'], generateNipaplaySignature('test-app', 1700000000, '/api/v2/comment/12345', 'test-secret'));
+    assert.strictEqual(request.url.includes('test-secret'), false);
+    assert.strictEqual(JSON.stringify(request).includes('test-secret'), false);
+  });
+
+  await t.test('环境配置快照对凭证脱敏', () => {
+    Globals.init({ NIPAPLAY_APP_ID: 'test-app', NIPAPLAY_APP_SECRET: 'test-secret' });
+    assert.strictEqual(Globals.envs.nipaplayAppId, 'test-app');
+    assert.strictEqual(Globals.envs.nipaplayAppSecret, 'test-secret');
+    assert.strictEqual(Globals.accessedEnvVars.NIPAPLAY_APP_ID, '*'.repeat('test-app'.length));
+    assert.strictEqual(Globals.accessedEnvVars.NIPAPLAY_APP_SECRET, '*'.repeat('test-secret'.length));
+    Globals.init({});
+  });
+
+  await t.test('关联 URL、平台路由与时间偏移保持一致', () => {
+    const location = 'https://x.test/redirect?urls=https://www.bilibili.com/video/BV1xx|https://ani.gamer.com.tw/animeVideo.php?sn=12345&shift=0,30';
+    const parsed = parseNipaplayRelatedLinks(location);
+    assert.strictEqual(parsed.bilibili[0].url, 'https://www.bilibili.com/video/BV1xx');
+    assert.strictEqual(parsed.bahamut[0].shift, 30);
+    assert.deepStrictEqual(resolveNipaplayLink(parsed.bahamut[0].url), { source: 'bahamut', realId: '12345' });
+
+    const source = { p: '12.34,1,25,16777215,0', t: 12.34 };
+    const shifted = applyShiftToDanmu(source, 5);
+    assert.strictEqual(shifted.p, '17.34,1,25,16777215,0');
+    assert.strictEqual(shifted.t, 17.34);
+    assert.strictEqual(source.p, '12.34,1,25,16777215,0');
+  });
+});

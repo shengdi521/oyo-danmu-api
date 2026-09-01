@@ -39,8 +39,14 @@ export function log(level, ...args) {
 }
 
 // 隐藏敏感信息的辅助函数
-function hideSensitiveInfo(message) {
+export function hideSensitiveInfo(message) {
   let processedMessage = message;
+
+  // URL query parameters and cookie fragments can contain only part of an encrypted
+  // environment value, so whole-value replacement below cannot catch them.
+  processedMessage = processedMessage
+    .replace(/([?&](?:access_key|auth_cookie|token)=)[^&\s]*/gi, '$1******')
+    .replace(/((?:^|[;\s])(?:P00001|P00007|SESSDATA|bili_jct)=)[^;\s]*/gi, '$1******');
 
   // 从 globals.originalEnvVars 获取被加密的环境变量值并替换
   // 通过比较 globals.originalEnvVars 和 globals.accessedEnvVars 来识别加密变量

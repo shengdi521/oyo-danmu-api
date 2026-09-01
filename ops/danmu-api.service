@@ -1,0 +1,30 @@
+[Unit]
+Description=oyo131 danmu API origin
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=danmu-api
+Group=danmu-api
+UMask=0027
+WorkingDirectory=/opt/oyo-danmu-api/current
+EnvironmentFile=/etc/danmu-api/danmu-api.env
+ExecStart=/usr/local/bin/node danmu_api/server.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/opt/oyo-danmu-api/current/config /opt/oyo-danmu-api/current/.cache
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryHigh=300M
+MemoryMax=360M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -56,8 +56,13 @@ const forwardRuntimeCompatPlugin = {
       return { path: 'dan-any', namespace: 'forward-optional-modules' };
     });
 
-    build.onResolve({ filter: /^node:async_hooks$/ }, () => ({
-      path: 'async-hooks',
+    build.onResolve({ filter: /^node:(?:async_hooks|https?|http)$/ }, (args) => ({
+      path: args.path === 'node:async_hooks' ? 'async-hooks' : args.path.slice('node:'.length),
+      namespace: 'forward-node-builtins'
+    }));
+
+    build.onResolve({ filter: /^node:(?:http|https)$/ }, (args) => ({
+      path: args.path.slice('node:'.length),
       namespace: 'forward-node-builtins'
     }));
 
@@ -90,6 +95,16 @@ const forwardRuntimeCompatPlugin = {
             }
           }
         }
+      `
+    }));
+
+    build.onLoad({ filter: /^(?:http|https)$/, namespace: 'forward-node-builtins' }, () => ({
+      loader: 'js',
+      contents: `
+        export class Agent {
+          constructor() {}
+        }
+        export default { Agent };
       `
     }));
 
@@ -176,6 +191,8 @@ const forwardRuntimeCompatPlugin = {
       ],
       define: {
         'widgetVersion': `"${Globals.VERSION}"`,
+        'globalThis.__FORWARD_WIDGET_RUNTIME__': 'true',
+        'globalThis.__FORWARD_WIDGET__': 'true',
         'globalThis.__FORWARD_WIDGET_DEBUG__': debugBuild ? 'true' : 'false'
       },
       banner: {

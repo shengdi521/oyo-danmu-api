@@ -627,10 +627,36 @@ export default class RenrenSource extends BaseSource {
     log("info", `[renren] 开始搜索: ${keyword}`);
     const isCloud = globals.deployPlatform && globals.deployPlatform !== 'node';
 
-    if (isCloud) {
-      return this._searchCloud(keyword);
+    const primaryKeyword = String(keyword || "").trim();
+    const spacedNumberKeyword = primaryKeyword.replace(
+      /([\u3400-\u9FFF\uF900-\uFAFF])([0-9０-９]+)$/u,
+      "$1 $2"
+    );
+    const searchOnce = (searchKeyword) => isCloud
+      ? this._searchCloud(searchKeyword)
+      : this._searchLocal(searchKeyword);
+
+    if (spacedNumberKeyword === primaryKeyword) {
+      const results = await searchOnce(primaryKeyword);
+      return Array.isArray(results) ? results : [];
     }
-    return this._searchLocal(keyword);
+
+    // Node 生产环境先给精确标题一次健康接口机会，避免完整降级链耗尽
+    // 多源搜索截止时间；接口异常时让空格变体从下一层继续，正常空结果
+    // 则保留当前层，以免错过仅接受空格变体的接口。
+    const primaryResults = isCloud
+      ? await this._searchCloud(primaryKeyword)
+      : await this._searchLocal(primaryKeyword, {
+          maxTierAttempts: 1,
+          advanceOnFailure: true
+        });
+    if (Array.isArray(primaryResults) && primaryResults.length > 0) {
+      return primaryResults;
+    }
+
+    log("info", `[renren] 紧贴数字标题无结果，使用空格变体重试: ${spacedNumberKeyword}`);
+    const fallbackResults = await searchOnce(spacedNumberKeyword);
+    return Array.isArray(fallbackResults) ? fallbackResults : [];
   }
 
   /**
@@ -703,17 +729,23 @@ export default class RenrenSource extends BaseSource {
   /**
    * 本地环境搜索：保持原有串行降级回路，沿用健康路由缓存
    */
-  async _searchLocal(keyword) {
+  async _searchLocal(keyword, { maxTierAttempts, advanceOnFailure = false } = {}) {
     let allResults = [];
     let hasValidResponse = false;
 
     const tiers = ['WIN', 'TV', 'MAC', 'WEB'];
+    const tierAttemptLimit = Math.max(
+      1,
+      Math.min(tiers.length, Number(maxTierAttempts) || tiers.length)
+    );
+    let tierAttempts = 0;
     let currentTierIndex = tiers.indexOf(API_HEALTH.search);
     if (currentTierIndex === -1) currentTierIndex = 0;
 
     // 智能路由检测与降级回路
     for (let i = currentTierIndex; i < tiers.length; i++) {
         const tier = tiers[i];
+        tierAttempts++;
         log("info", `[renren] 尝试使用 ${tier} 端接口搜索`);
 
         try {
@@ -752,12 +784,21 @@ export default class RenrenSource extends BaseSource {
         } catch (e) {
             log("info", `[renren] ${tier} 端搜索异常，触发降级: ${e.message}`);
         }
+
+        if (tierAttempts >= tierAttemptLimit) break;
     }
 
     // 所有降级接口全部“异常报错”时，重置健康状态
     if (!hasValidResponse) {
-        log("info", `[renren] 搜索域所有降级接口均异常失败，重置健康状态至 WIN 端`);
-        API_HEALTH.search = 'WIN';
+        const nextTierIndex = currentTierIndex + tierAttempts;
+        if (advanceOnFailure && nextTierIndex < tiers.length) {
+            const nextTier = tiers[nextTierIndex];
+            log("info", `[renren] 当前搜索接口异常，空格变体将从 ${nextTier} 端继续`);
+            API_HEALTH.search = nextTier;
+        } else {
+            log("info", `[renren] 搜索域所有降级接口均异常失败，重置健康状态至 WIN 端`);
+            API_HEALTH.search = 'WIN';
+        }
     }
 
     return allResults;
@@ -1024,7 +1065,31 @@ export default class RenrenSource extends BaseSource {
 
   async _getDetailLocal(id, episodeSid) {
     let detail = null;
-    const tiers = ['WEB', 'TV', 'MAC', 'WIN'];
+    let tiers = ['WEB', 'TV', 'MAC', 'WIN'];
+
+    // 空格回退若已由 TV 搜索命中，让 WEB 与 TV 详情竞速，避免串行详情
+    // 再次吃满搜索总截止时间。两个主接口都失败后再降级到 MAC/WIN。
+    if (API_HEALTH.detail === 'WEB' && API_HEALTH.search === 'TV') {
+      log("info", `[renren] TV 搜索已连通，并行竞速 WEB/TV 详情 (ID=${id})`);
+      const cancel = new AbortController();
+      const validDetail = (tier, promise) => Promise.resolve(promise).then((value) => {
+        if (!value) throw new Error(`${tier} detail unavailable`);
+        return { tier, value };
+      });
+
+      try {
+        const winner = await Promise.any([
+          validDetail('WEB', this.getWebDramaDetailFallback(String(id), cancel.signal)),
+          validDetail('TV', this.getAppDramaDetail(String(id), String(episodeSid), cancel.signal)),
+        ]);
+        cancel.abort();
+        API_HEALTH.detail = winner.tier;
+        return winner.value;
+      } catch (_) {
+        cancel.abort();
+        tiers = ['MAC', 'WIN'];
+      }
+    }
 
     let currentTierIndex = tiers.indexOf(API_HEALTH.detail);
     if (currentTierIndex === -1) currentTierIndex = 0;

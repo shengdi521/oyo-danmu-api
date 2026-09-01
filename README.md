@@ -36,7 +36,7 @@ LogVar 弹幕 API 服务器
 - [使用 Docker 运行](#使用-docker-运行)
 - [Docker 一键启动 【推荐】](#docker-一键启动-推荐)
 - [部署到 Vercel 【推荐】](#部署到-vercel-推荐)
-- [部署到 Netlify 【推荐】](#部署到-netlify-推荐)
+- [部署到 Netlify](#部署到-netlify)
 - [部署到 腾讯云 edgeone pages](#部署到-腾讯云-edgeone-pages)
 - [部署到 Cloudflare](#部署到-cloudflare)
 - [部署到 Hugging Face Spaces](#部署到-hugging-face-spaces)
@@ -145,7 +145,7 @@ LogVar 弹幕 API 服务器
    ```bash
    npm start
    ```
-   服务器将在 `http://{ip}:9321` 运行，默认token是`87654321`。
+   服务器将在 `http://{ip}:9321` 运行，默认token是`87654321`。Node 服务默认通过 `::` 同时监听 IPv6 和 IPv4；不支持 IPv6 绑定时会自动回退到 `0.0.0.0`。IPv6 地址访问格式为 `http://[IPv6地址]:9321`。若操作系统强制启用了 `IPV6_V6ONLY`，需调整系统网络策略后才能通过同一监听端口接受 IPv4 连接。
    如需修改端口，可设置环境变量 `DANMU_API_PORT`（例如 `DANMU_API_PORT=8080 npm start`）。
    HTTPS 反向代理应传递 `X-Forwarded-Proto`；无法传递时可设置 `DANMU_API_PUBLIC_PROTO=https`，用于生成正确的对外弹幕链接。
 
@@ -214,6 +214,8 @@ GET http://127.0.0.1:9321/87654321/api/logs
    ```
    - 使用`-e TOKEN=87654321`设置`TOKEN`环境变量，覆盖Dockerfile中的默认值。
    - 或使用 `--env-file .env` 加载 .env 文件中的所有环境变量：`docker run -d -p 9321:9321 --name danmu-api --env-file .env danmu-api`
+
+   > 容器内服务默认启用 IPv4/IPv6 双栈监听。通过 IPv6 从宿主机访问时，Docker 守护进程及容器网络也需要启用 IPv6；否则仍可正常使用 IPv4。
 
    **热更新支持**：如需支持环境变量热更新（修改 `.env` 文件后无需重启容器），请使用 Volume 挂载：
    ```bash
@@ -306,7 +308,7 @@ GET http://127.0.0.1:9321/87654321/api/logs
   > hk有可能访问不了360或其他源，可以尝试切其他region
 - vercel在国内被墙，请配合代理或绑定自定义域名使用
 
-## 部署到 Netlify 【推荐】
+## 部署到 Netlify
 
 > ⚠️ **风险提示：Netlify 存在封号风险！**
 >
@@ -452,12 +454,17 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | VOD_SERVERS      | 【可选】VOD服务器列表，支持多个服务器并发查询，格式：`名称@URL,名称@URL,...`，示例：`金蝉@https://zy.jinchancaiji.com,789@https://www.caiji.cyou,听风@https://gctf.tfdh.top`，不填默认为`金蝉@https://zy.jinchancaiji.com,789@https://www.caiji.cyou,听风@https://gctf.tfdh.top`       |
 | VOD_RETURN_MODE      | 【可选】VOD返回模式，可选值：`all`（返回所有站点结果）、`fastest`（只返回最快的站点结果），默认为`fastest`。当配置多个VOD站点时，`all`模式会返回所有站点的结果（结果较多），`fastest`模式只返回首先响应成功的站点结果（结果较少，避免重复）       |
 | VOD_REQUEST_TIMEOUT      | 【可选】VOD服务器单个请求超时时间（毫秒），防止慢速或失效的采集站阻塞搜索，默认为`10000`（10秒），建议值：`5000-15000`。由于`fastest`模式只返回最快响应的站点，可以设置较大的超时时间给慢速站点更多机会       |
+| SEARCH_REQUEST_DEADLINE_MS | 【可选】整次多源搜索总截止时间（毫秒），到期后中止未完成请求并返回已经完成的来源，默认`8000`（8秒），建议值：`5000-15000`       |
+| SEARCH_EARLY_RETURN_MS | 【可选】Node 多源搜索在已获得有效候选时的最早返回时间（毫秒），默认`2000`；不会超过总截止时间       |
+| SEARCH_EARLY_RETURN_MIN_RESULTS | 【可选】自适应提前返回所需的最少有效候选数，默认`1`       |
+| SEARCH_EARLY_RETURN_MIN_SOURCES | 【可选】自适应提前返回前至少已完成的来源数，默认`8`，返回排序仍严格遵循`SOURCE_ORDER`       |
+| SEARCH_EARLY_RETURN_PRIORITY_SOURCES | 【可选】自适应提前返回前必须全部完成的最高优先级来源数，默认`4`；按`SOURCE_ORDER`从首项开始计算       |
 | BILIBILI_COOKIE      | 【可选】b站cookie（填入后能抓取完整弹幕和启用港澳台App接口），如 `buvid3=E2BCA ... eao6; theme-avatar-tip-show=SHOWED`，请自行通过浏览器或抓包工具抓取，热心网友测试后，弹幕获取实际最少只需取 `SESSDATA=xxxx` 字段，但如果需要使用港澳台区域稳定的App搜索接口还需要`bili_jct=xxxx`或`access_key=xxxx` 字段，不知道怎么获取cookie的，可以从工具 [cookie-butler](https://cookie-butler.do-u.me) 获取    |
 | DOUBAN_COOKIE      | 【可选】豆瓣cookie，用于豆瓣相关接口请求，配置后可降低豆瓣接口风控影响，提升搜索/详情获取的稳定性。填写浏览器中已登录豆瓣后的完整 Cookie 字符串即可，格式示例：`bid=xxxx; ll="118282"; ...`。如遇到豆瓣搜索不稳定、返回异常或频繁验证，建议优先补充该变量       |
 | YOUKU_CONCURRENCY    | 【可选】youku弹幕请求并发数，用于加快youku弹幕请求速度，不填默认为`8`，最高`16`       |
-| SOURCE_ORDER    | 【可选】源排序，用于按源对返回资源的排序（注意：先后顺序会影响自动匹配最终的返回），默认是`douban,360,renren,hanjutv`，表示douban数据排在最前，hanjutv数据排在最后，示例：`douban,renren`：只返回douban数据和renren数据，且douban数据靠前；当前可选择的源字段有 `360,vod,tmdb,douban,tencent,youku,iqiyi,imgo,bilibili,migu,sohu,leshi,xigua,maiduidui,aiyifan,hongguo,renren,hanjutv,dandan,bahamut,animeko,custom`       |
-| PLATFORM_ORDER    | 【可选】自动匹配优选平台，按顺序优先返回指定平台弹幕，默认为空，即返回第一个满足条件的平台，示例：`bilibili1,qq`，表示如果有b站的播放源，则优先返回b站的弹幕，否则就返回腾讯的弹幕，两者都没有，则返回第一个满足条件的平台，当配置合并平台的时候为指定期望的合并源；当前可选择的平台字段有 `qiyi, bilibili1, imgo, youku, qq, migu, sohu, leshi, xigua, maiduidui, aiyifan, hongguo, renren, hanjutv, dandan, bahamut, animeko, custom`  |
-| MERGE_SOURCE_PAIRS    | 【可选】源合并配置，配置后将对应源合并同时一起获取弹幕返回，默认为空，格式是`源字段&源字段&源字段`，示例：`dandan&bahamut&animeko,renren&hanjutv,renren`， 允许多组、允许同时存在、允许多源，允许填单源表示保留原结果，一组中第一个为主源其余为副源，副源往主源合并，主源如果没有结果会轮替下一个作为主源循环，目前允许合并的源字段有`tencent,youku,iqiyi,imgo,bilibili,migu,sohu,leshi,xigua,maiduidui,aiyifan,hongguo,renren,hanjutv,dandan,bahamut,animeko` |
+| SOURCE_ORDER    | 【可选】源排序，用于按源对返回资源的排序（注意：先后顺序会影响自动匹配最终的返回），默认是`douban,360,renren,hanjutv`，表示douban数据排在最前，hanjutv数据排在最后，示例：`douban,renren`：只返回douban数据和renren数据，且douban数据靠前；当前可选择的源字段有 `360,vod,tmdb,douban,tencent,youku,iqiyi,imgo,bilibili,migu,sohu,leshi,xigua,maiduidui,aiyifan,hongguo,renren,hanjutv,dandan,bahamut,animeko,acfun,niconico,custom`。Niconico 建议排在最后，地域限制、付费或需登录视频会自动跳过       |
+| PLATFORM_ORDER    | 【可选】自动匹配优选平台，按顺序优先返回指定平台弹幕，默认为空，即返回第一个满足条件的平台，示例：`bilibili1,qq`，表示如果有b站的播放源，则优先返回b站的弹幕，否则就返回腾讯的弹幕，两者都没有，则返回第一个满足条件的平台，当配置合并平台的时候为指定期望的合并源；当前可选择的平台字段有 `qiyi, bilibili1, imgo, youku, qq, migu, sohu, leshi, xigua, maiduidui, aiyifan, hongguo, renren, hanjutv, dandan, bahamut, animeko, acfun, niconico, custom`  |
+| MERGE_SOURCE_PAIRS    | 【可选】源合并配置，配置后将对应源合并同时一起获取弹幕返回，默认为空，格式是`源字段&源字段&源字段`，示例：`dandan&bahamut&animeko,renren&hanjutv,renren`， 允许多组、允许同时存在、允许多源，允许填单源表示保留原结果，一组中第一个为主源其余为副源，副源往主源合并，主源如果没有结果会轮替下一个作为主源循环，目前允许合并的源字段有`tencent,youku,iqiyi,imgo,bilibili,migu,sohu,leshi,xigua,maiduidui,aiyifan,hongguo,renren,hanjutv,dandan,bahamut,animeko,acfun,niconico` |
 | CUSTOM_MERGE_RULES | 【可选】合并映射表，用于自定义源合并行为，默认为空。<br>格式 1 (合并)：`副源剧名/S季数@来源 -> 主源剧名/S季数@来源 \| E副源集数>E主源集数`<br>格式 2 (阻断)：`副源剧名/S季数@来源 × 主源剧名/S季数@来源`<br>说明：`[/S季数]` 与 `[\|路由规则]` 为可选项，留空则交由程序判断。多个规则用分号隔开，多段路由用逗号分隔。<br>示例：<br>1. 常规合并：`天气之子@bilibili -> 天气之子@dandan`<br>2. 多集路由：`我推的孩子/S01@bahamut -> 我推的孩子/S03@dandan \| E25~E35>E25~E35`<br>3. 阻断合并：`辉夜大小姐想让我告白？～天才们的恋爱头脑战～(2020)@bilibili × 辉夜大小姐想让我告白～天才们的恋爱头脑战～ OVA(2021)【OVA】@dandan` |
 | ANIME_TITLE_FILTER    | 【可选】剧名过滤规则，用于按正则表达式对剧名进行过滤，适用于过滤一些不需要的剧集，需开启ENABLE_ANIME_EPISODE_FILTER，默认值：空（不过滤），格式：使用 \| 分隔多个关键词，例如：广告\|预告\|无关剧名       |
 | EPISODE_TITLE_FILTER    | 【可选】剧集标题正则过滤，按正则关键字对剧集或综艺的集标题进行过滤，适用于过滤一些预告或综艺非正式集，只支持match自动匹配，默认值如下 |
@@ -479,7 +486,7 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | DANMU_SIMPLIFIED_TRADITIONAL    | 【可选】弹幕简繁体转换设置：default（默认不转换）、simplified（繁转简）、traditional（简转繁）       |
 | DANMU_OFFSET      | 【可选】弹幕时间偏移配置，用于解决弹幕与视频不同步的问题。格式：剧名:秒（全剧偏移）或 剧名/季:秒（整季偏移）或 剧名/季/集:秒（单集偏移），支持指定来源：剧名@来源:秒 或 剧名/季@来源1&来源2:秒（不指定来源则对所有来源生效），多条用逗号分隔。例如：`overlord/S01:90, re-zero/S02@bilibili:120, re-zero/S02/E03@dandan&bilibili:10`。正数表示弹幕延后（向右），负数表示弹幕提前（向左）。支持百分比模式，在路径/来源末尾添加 `%`，例如：`东方/S03/E02@tencent%:11`，按 `原时间 * (视频时长 + 偏移秒数) / 视频时长` 计算新的弹幕发送时间。       |
 | UI_THEME    | 【可选】管理界面默认主题，默认为 `lavender`（经典默认）。浏览器中选择的主题会保存在本地并优先使用。可选值：`lavender`（经典默认）、`shinyo`（新叶绿）、`sakura`（哔哩粉）、`tianyi`（天依蓝）、`hatsune`（初音青）、`sakuragi`（樱木红）、`violet`（罗兰紫）、`amber`（LCL橘）       |
-| PROXY_URL    | 【可选】代理/反代地址，目前只对巴哈姆特、TMDB API、bilibili、animeko生效，支持格式：<br> 正常代理：`http://127.0.0.1:7890` <br> 万能反代：`@http://127.0.0.1` <br> 特定反代：`源字段@http://127.0.0.1`，目前支持的字段有：`bahamut,tmdb,bilibili,animeko`（bilibili字段会启用阿b的港澳台番剧的搜索与获取）<br> 混合配置/示例：`http://你的代理地址:28233,bahamut@你的巴哈反代地址,tmdb@你的tmdb反代地址,@你的万能反代地址` <br> 优先级：特定反代 > 万能反代 > 正常代理，高优先级覆盖低优先级使用。 <br> （注意：如果巴哈姆特请求不通，会拖慢搜索返回速度，如需使用bahamut源请在SOURCE_ORDER环境变量中手动添加`bahamut`）如果你使用docker部署并且访问不了 bahamut / animeko 源或 TMDB API ，请配置代理/反代地址（animeko 也可通过开启 Bangumi Data 解决）（[Netlify反代教程](https://github.com/wan0ge/bahamut-api-proxy)）；vercel/netlify/cf中理应都自然能联通，不用填写       |
+| PROXY_URL    | 【可选】代理/反代地址，目前只对巴哈姆特、TMDB API、bilibili、animeko、niconico生效，支持格式：<br> 正常代理：`http://127.0.0.1:7890` <br> 万能反代：`@http://127.0.0.1` <br> 特定反代：`源字段@http://127.0.0.1`，目前支持的字段有：`bahamut,tmdb,bilibili,animeko,niconico`（bilibili字段会启用阿b的港澳台番剧的搜索与获取，niconico 可用于配置合法的地区反代）<br> 混合配置/示例：`http://你的代理地址:28233,bahamut@你的巴哈反代地址,niconico@你的 Niconico 反代地址,@你的万能反代地址` <br> 优先级：特定反代 > 万能反代 > 正常代理，高优先级覆盖低优先级使用。 <br> （注意：不可用的代理会拖慢搜索返回速度）如果你使用docker部署并且访问不了 bahamut / animeko / niconico 源或 TMDB API，请配置代理/反代地址（animeko 也可通过开启 Bangumi Data 解决）（[Netlify反代教程](https://github.com/wan0ge/bahamut-api-proxy)）；vercel/netlify/cf中理应都自然能联通，不用填写       |
 | TMDB_API_KEY    | 【可选】TMDB API Key地址，目前只对巴哈姆特生效，配置后并行从TMDB获取日语原名搜索巴哈（如果TMDB条目类型不是动画或制作地区不是jp则不会进行巴哈搜索）可以解决巴哈译名不同导致的搜索无结果问题，例如大陆常用译名`间谍过家家`在巴哈译名为`間諜家家酒`，正常搜索无法搜索到，配置后可以解决这一问题但会稍微影响请求速度，[TMDBAPI](https://www.themoviedb.org/settings/api)获取方法参考：[TMDB API Key申请 - 绿联NAS私有云](https://www.ugnas.com/tutorial-detail/id-226.html)       |
 | RATE_LIMIT_MAX_REQUESTS    | 【可选】限流配置：1分钟内同一IP最大请求次数，默认为`3`，设置为`0`表示不限流       |
 | IP_BLACKLIST    | 【可选】IP 黑名单列表，命中则拒绝请求。支持逗号/分号/换行分隔，支持 `/regex/` 或 `/regex/i` 正则，支持 IPv4/IPv6 CIDR，例如：`192.168.1.10,10.0.0.0/24,2001:db8::/64,/^203\.0\.113\./`       |
@@ -504,6 +511,9 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | AI_API_KEY      | 【可选】AI服务的API密钥，用于身份验证，默认为空，需手动填写       |
 | AI_MATCH_PROMPT      | 【可选】AI匹配提示词，用于自定义AI匹配行为，不填提供默认提示词，提示词如下       |
 | USE_BANGUMI_DATA      | 【可选】[Bangumi Data](https://github.com/bangumi-data/bangumi-data) 加速匹配开关，默认值：`false`（关闭），开启后将动画元数据缓存至本地或内存中给源调用，提升动画源的检索与匹配速度并解锁隐藏/区域番剧（本地和Docker部署使用时请先挂载.cache目录获得最佳体验，云部署使用时会将数据缓存至临时内存中如果体验不佳请关闭）       |
+| NIPAPLAY_APP_ID      | 【可选】弹弹play开放平台 App ID，仅用于 NipaPlay 302 关联弹幕；需由部署者合法申请并以运行时环境变量注入，禁止写入源码       |
+| NIPAPLAY_APP_SECRET      | 【可选】弹弹play开放平台 App Secret，仅用于 NipaPlay 302 关联弹幕；需由部署者合法申请并以运行时环境变量注入，禁止写入源码       |
+| NIPAPLAY_REPLACE_DANDAN      | 【可选】 [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) 弹弹302关联弹幕替代开关（用于 dandan 源），默认为`false`（关闭，使用弹弹原生弹幕），可选值：`true`、`false`。仅在 `NIPAPLAY_APP_ID` 和 `NIPAPLAY_APP_SECRET` 均已配置时启用关联链路；否则安全跳过并保留弹弹原生弹幕。开启后 dandan 源以 nipaplay 弹弹302关联弹幕替代弹弹原生弹幕，因使用的是项目链路获取弹幕所以`1.会丢失弹弹平台弹幕` `2.无法获取下架视频` `3.如果关联中有巴哈姆特平台需要确保能够连通巴哈`       |
 
 ```regex
 # EPISODE_TITLE_FILTER 默认值
@@ -606,7 +616,11 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | bahamut  | bahamut |
 | dandan   | [dandan](https://www.dandanplay.com/) |
 | animeko  | [animeko](https://github.com/open-ani/animeko) |
+| acfun    | [AcFun](https://www.acfun.cn/) |
+| niconico | [Niconico](https://www.nicovideo.jp/) |
 | custom   | custom |
+
+AcFun 会优先使用番剧搜索；当官方番剧接口返回空列表时，自动降级到公开视频搜索，并只保留标题匹配、实际带弹幕的视频。该降级源建议与 Niconico 一样放在 `SOURCE_ORDER` 末尾。
 
 ## 项目结构
 ```
@@ -657,7 +671,9 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │   │   └── dandan-model.js     # 弹弹play数据模型
 │   ├── sources/
 │   │   ├── aiyifan.js          # 爱壹帆源
+│   │   ├── acfun.js            # AcFun源
 │   │   ├── animeko.js          # Animeko源
+│   │   ├── niconico.js         # Niconico 官方公开源
 │   │   ├── bahamut.js          # 巴哈姆特源
 │   │   ├── base.js             # 弹幕源获取基类
 │   │   ├── bilibili.js         # b站源
@@ -718,8 +734,10 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │       ├── log-util.js         # 日志工具
 │       ├── merge-util.js       # 源合并处理工具
 │       ├── migu-util.js        # 咪咕工具
+│       ├── nipaplay-util.js    # NipaPlay 弹弹302关联链接工具
 │       ├── offset-util.js      # 弹幕偏移工具
 │       ├── redis-util.js       # redis工具
+│       ├── server-listen-util.js # IPv4/IPv6 双栈监听与 IPv4 回退工具
 │       ├── time-util.js        # 时间日期工具
 │       ├── tmdb-util.js        # TMDB API请求处理工具
 │       └── zh-util.js          # 中文繁简转换工具
@@ -788,7 +806,11 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 ### 特别感谢
 - 开源项目 [danmaku-anywhere](https://github.com/Mr-Quin/danmaku-anywhere) 提供的[弹弹play开放平台](https://doc.dandanplay.com/open/)接口
 
+- 开源项目 [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload) 提供的[弹弹play开放平台](https://doc.dandanplay.com/open/)302关联链接请求授权
+
 - 开源项目 [animeko](https://github.com/open-ani/animeko) 提供的弹幕API
+
+- [Niconico Snapshot Search、系列 API 与 nvComment](https://www.nicovideo.jp/) 提供公开搜索、分集与时间轴弹幕
 
 - 开源项目 [bangumi-data](https://github.com/bangumi-data/bangumi-data) 提供的平台动画元数据
 

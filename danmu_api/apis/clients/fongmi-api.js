@@ -48,6 +48,8 @@ const FONGMI_DATE_PATTERNS = [
   { pattern: /(\d{4})(\d{2})(\d{2})/, type: "ymd_compact" }                 // 20250513 (8位紧凑日期)
 ];
 
+const FONGMI_MAX_CANDIDATES = 50;
+
 /**
  * 规范化 FongMi 传入文本，统一大小写、空格和简繁体。
  * @param {string} value 原始文本
@@ -201,10 +203,24 @@ function buildFongmiApiBase(req) {
   const apiMarker = "/api/v2/";
   const danmakuMarker = "/danmaku";
 
+  const forwardedHost = (req.headers?.get?.("x-forwarded-host") || "")
+    .split(",", 1)[0]
+    .trim();
+  const forwardedProto = (req.headers?.get?.("x-forwarded-proto") || "")
+    .split(",", 1)[0]
+    .trim()
+    .toLowerCase();
+  const safeForwardedHost = /^[a-z0-9.-]+(?::\d{1,5})?$/i.test(forwardedHost)
+    ? forwardedHost
+    : "";
+  const publicOrigin = safeForwardedHost
+    ? `${forwardedProto === "http" ? "http" : "https"}://${safeForwardedHost}`
+    : reqUrl.origin;
+
   let prefix = "";
   const apiMarkerIndex = path.indexOf(apiMarker);
   if (apiMarkerIndex >= 0) {
-    prefix = path.slice(0, apiMarkerIndex);
+    prefix = path.slice(0, apiMarkerIndex).replace(/\/danmaku$/i, "");
   } else {
     const danmakuIndex = path.indexOf(danmakuMarker);
     if (danmakuIndex >= 0) {
@@ -214,7 +230,7 @@ function buildFongmiApiBase(req) {
     }
   }
 
-  return `${reqUrl.origin}${prefix}`;
+  return `${publicOrigin}${prefix}`;
 }
 
 /**
@@ -403,16 +419,29 @@ export async function getFongmiDanmaku(url, req) {
     }))
     .sort((a, b) => b.score - a.score);
 
+  const sourceHeads = [];
+  const sourceTails = [];
+  const seenSources = new Set();
+  for (const candidate of candidates) {
+    const source = String(candidate?.anime?.source || "unknown");
+    if (!seenSources.has(source)) {
+      seenSources.add(source);
+      sourceHeads.push(candidate);
+    } else {
+      sourceTails.push(candidate);
+    }
+  }
+
   const seen = new Set();
   const items = [];
-  for (const candidate of candidates) {
+  for (const candidate of [...sourceHeads, ...sourceTails]) {
     if (!candidate?.commentUrl || seen.has(candidate.commentUrl)) continue;
     seen.add(candidate.commentUrl);
     items.push({
       name: `${candidate.anime.animeTitle} - ${candidate.episode.episodeTitle}`,
       url: candidate.commentUrl
     });
-    if (items.length >= 1000) break;
+    if (items.length >= FONGMI_MAX_CANDIDATES) break;
   }
 
   log("info", `[system] [fongmi] name=${name}, episode=${episode}, candidates=${items.length}`);
