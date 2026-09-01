@@ -140,7 +140,7 @@ function cacheTtl(pathname, method) {
   if (method !== "GET") return 0;
   if (/\/api\/v2\/(?:comment|extcomment|segmentcomment)(?:\/|$)/i.test(pathname)) return 1800;
   if (/\/api\/v2\/bangumi(?:\/|$)/i.test(pathname)) return 900;
-  if (/\/api\/v2\/(?:search\/anime|search\/episodes|fongmi\/danmaku)(?:\/|$)/i.test(pathname)) return 180;
+  if (/\/api\/v2\/(?:search\/anime|search\/episodes|fongmi\/danmaku)(?:\/|$)/i.test(pathname)) return 600;
   return 0;
 }
 

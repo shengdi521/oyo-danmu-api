@@ -20,7 +20,7 @@ function environment(overrides = {}) {
 
 test("cache TTLs cover stable reads and validated segment POSTs", () => {
   assert.equal(internals.cacheTtl("/api/v2/comment/1", "GET"), 1800);
-  assert.equal(internals.cacheTtl("/api/v2/search/anime", "GET"), 180);
+  assert.equal(internals.cacheTtl("/api/v2/search/anime", "GET"), 600);
   assert.equal(internals.cacheTtl("/api/v2/segmentcomment", "POST"), 1800);
   assert.equal(internals.cacheTtl("/api/v2/match", "POST"), 0);
 });
